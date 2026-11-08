@@ -160,19 +160,30 @@ async fn ide_catalog(cfg: &ProviderConfig, project_dir: &Path) -> Result<ModelCa
             let bin = crate::ide_bridge::resolve_program(IdeKind::ClaudeCode);
             let exists = !bin.is_empty() && Path::new(&bin).is_file();
             let note = if exists {
-                format!("Claude CLI bulundu: {bin}. (Boş bırakırsan CLI varsayılanı)")
+                format!("Claude CLI bulundu: {bin}")
             } else {
                 "Claude CLI bulunamadı. Kurulumdan sonra `CLAUDE_BIN` ortam değişkeniyle yolunu belirtebilirsin.".into()
             };
 
-            let models = ["sonnet", "opus", "haiku"]
-                .iter()
-                .map(|alias| ModelInfo {
-                    id: (*alias).to_string(),
-                    name: format!("Claude {alias} (alias)"),
-                    context: None,
-                })
-                .collect();
+            let models = [
+                ("claude-opus-5-5", "Claude Opus 5.5"),
+                ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+                ("claude-opus-4-6", "Claude Opus 4.6"),
+                ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+                ("claude-3-7-sonnet", "Claude 3.7 Sonnet"),
+                ("claude-3-5-sonnet", "Claude 3.5 Sonnet"),
+                ("claude-3-5-haiku", "Claude 3.5 Haiku"),
+                ("opus", "Opus (alias)"),
+                ("sonnet", "Sonnet (alias)"),
+                ("haiku", "Haiku (alias)"),
+            ]
+            .iter()
+            .map(|(id, name)| ModelInfo {
+                id: (*id).to_string(),
+                name: (*name).to_string(),
+                context: None,
+            })
+            .collect();
             Ok(ModelCatalog {
                 note,
                 models,
@@ -184,24 +195,24 @@ async fn ide_catalog(cfg: &ProviderConfig, project_dir: &Path) -> Result<ModelCa
             let exists = !program.is_empty() && Path::new(&program).is_file();
 
             let models = [
-                "claude-3-7-sonnet",
-                "claude-3-5-sonnet",
-                "gpt-4o",
-                "o3-mini",
-                "cursor-small",
+                ("claude-3-7-sonnet", "Claude 3.7 Sonnet"),
+                ("claude-3-5-sonnet", "Claude 3.5 Sonnet"),
+                ("gpt-4o", "GPT-4o"),
+                ("o3-mini", "o3-mini"),
+                ("cursor-small", "Cursor Small"),
             ]
             .iter()
-            .map(|id| ModelInfo {
+            .map(|(id, name)| ModelInfo {
                 id: (*id).to_string(),
-                name: (*id).to_string(),
+                name: (*name).to_string(),
                 context: None,
             })
             .collect();
 
             let note = if exists {
-                format!("Cursor bulundu: {program}. (Boş bırakırsan varsayılan kullanılır)")
+                format!("Cursor bulundu: {program}")
             } else {
-                "Cursor CLI bulunamadı. Kurulumdan sonra `CURSOR_AGENT_BIN` ile tam yolu girebilirsin.".into()
+                "Cursor CLI bulunamadı. Yolu için `CURSOR_AGENT_BIN` veya Custom CLI kullanabilirsin.".into()
             };
 
             Ok(ModelCatalog {
