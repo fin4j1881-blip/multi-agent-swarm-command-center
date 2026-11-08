@@ -498,10 +498,16 @@ const PERSISTED_FIELDS = [
   "maxTokens",
 ];
 
+function projectStorageKey(path) {
+  const clean = (path || "").trim().replace(/\/+$/, "");
+  return clean ? `swarm.project.${clean}` : null;
+}
+
 function persist() {
   clearTimeout(state.saveTimer);
   state.saveTimer = setTimeout(() => {
     try {
+      const currentPath = $("projectPath").value.trim();
       const data = { source: { arch: sourceFor("arch"), coder: sourceFor("coder") } };
       for (const id of PERSISTED_FIELDS) {
         const el = $(id);
@@ -520,11 +526,52 @@ function persist() {
           ideFallback: $(`${prefix}IdeFallbackModel`).value,
         };
       }
+      // Save global last-state
       localStorage.setItem("swarm.settings.v1", JSON.stringify(data));
+
+      // Also save project-specific vision & instructions under project key
+      const pKey = projectStorageKey(currentPath);
+      if (pKey) {
+        const projectData = {
+          vision: $("vision").value,
+          instructions: $("instructions").value,
+          models: data.models,
+        };
+        localStorage.setItem(pKey, JSON.stringify(projectData));
+      }
     } catch {
       /* storage unavailable */
     }
   }, 300);
+}
+
+function loadProjectData(path) {
+  const pKey = projectStorageKey(path);
+  if (!pKey) return;
+  try {
+    const raw = localStorage.getItem(pKey);
+    if (!raw) return;
+    const pData = JSON.parse(raw);
+    if (typeof pData.vision === "string") {
+      $("vision").value = pData.vision;
+      $("visionCount").textContent = `${pData.vision.trim().length}`;
+    }
+    if (typeof pData.instructions === "string") {
+      $("instructions").value = pData.instructions;
+    }
+    if (pData.models) {
+      for (const prefix of ["arch", "coder"]) {
+        const saved = pData.models[prefix];
+        if (!saved) continue;
+        setSelectValue($(`${prefix}Model`), saved.api);
+        setSelectValue($(`${prefix}FallbackModel`), saved.apiFallback);
+        setSelectValue($(`${prefix}IdeModel`), saved.ide);
+        setSelectValue($(`${prefix}IdeFallbackModel`), saved.ideFallback);
+      }
+    }
+  } catch {
+    /* ignore */
+  }
 }
 
 function setSelectValue(select, value) {
@@ -586,6 +633,7 @@ async function pickFolder() {
     const folder = await invoke("select_folder");
     if (folder) {
       $("projectPath").value = folder;
+      loadProjectData(folder);
       persist();
     }
   } catch (error) {
@@ -674,6 +722,11 @@ function bind() {
   $("pickFolderBtn").addEventListener("click", pickFolder);
   $("startBtn").addEventListener("click", start);
   $("stopBtn").addEventListener("click", stop);
+
+  $("projectPath").addEventListener("change", () => {
+    loadProjectData($("projectPath").value);
+    persist();
+  });
 
   document.querySelectorAll(".seg").forEach((button) => {
     button.addEventListener("click", () => {
