@@ -159,6 +159,28 @@ async fn list_models(
     models::list_models(&config, &probe_dir(project_path)).await
 }
 
+/// Opens a new native application window from within the same Tauri process.
+/// This completely avoids multi-process WebKit/NVIDIA buffer collisions and flickering.
+#[tauri::command]
+async fn open_new_window(app: AppHandle) -> Result<(), String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(2);
+
+    let idx = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let label = format!("window-{idx}");
+
+    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App("index.html".into()))
+        .title("Swarm Command Center")
+        .inner_size(1320.0, 880.0)
+        .min_inner_size(1000.0, 640.0)
+        .resizable(true)
+        .center()
+        .build()
+        .map_err(|e| format!("Yeni pencere açılamadı: {e}"))?;
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let shared: SharedState = Arc::new(Mutex::new(AppState::default()));
@@ -173,7 +195,8 @@ pub fn run() {
             get_status,
             get_stats,
             check_provider,
-            list_models
+            list_models,
+            open_new_window
         ])
         .run(tauri::generate_context!())
         .expect("Tauri uygulaması başlatılamadı");

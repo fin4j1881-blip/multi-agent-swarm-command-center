@@ -723,6 +723,24 @@ function bind() {
   $("startBtn").addEventListener("click", start);
   $("stopBtn").addEventListener("click", stop);
 
+  const newWindowHandler = async () => {
+    try {
+      await invoke("open_new_window");
+    } catch (e) {
+      toast(`Yeni pencere açılamadı: ${e}`, "error");
+    }
+  };
+
+  const newWindowBtn = $("newWindowBtn");
+  if (newWindowBtn) newWindowBtn.addEventListener("click", newWindowHandler);
+
+  window.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && (e.key === "n" || e.key === "N")) {
+      e.preventDefault();
+      newWindowHandler();
+    }
+  });
+
   $("projectPath").addEventListener("change", () => {
     loadProjectData($("projectPath").value);
     persist();
