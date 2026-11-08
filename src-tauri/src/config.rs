@@ -285,6 +285,8 @@ impl ProviderConfig {
 pub struct AgentConfig {
     pub project_path: String,
     pub vision: String,
+    #[serde(default)]
+    pub instructions: String,
     pub architect: ProviderConfig,
     pub coder: ProviderConfig,
     #[serde(default = "default_max_attempts")]

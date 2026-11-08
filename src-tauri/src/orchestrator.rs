@@ -94,7 +94,15 @@ async fn run_inner(app: &AppHandle, shared: &SharedState, cfg: &AgentConfig) -> 
         .await;
 
         let tree = workspace::scan_tree(&root, cfg.tree_entries);
-        let prompt = prompts::plan_prompt(&cfg.vision, &tree, &completed, &failures, round, rounds);
+        let prompt = prompts::plan_prompt(
+            &cfg.vision,
+            &cfg.instructions,
+            &tree,
+            &completed,
+            &failures,
+            round,
+            rounds,
+        );
 
         let raw_plan = architect
             .complete(&prompt, &prompts::architect_system(cfg.max_tasks))
@@ -246,6 +254,7 @@ async fn execute_task(
 
         let prompt = prompts::coder_prompt(
             &cfg.vision,
+            &cfg.instructions,
             task,
             current.as_deref(),
             &feedback,

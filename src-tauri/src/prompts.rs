@@ -25,6 +25,7 @@ ZORUNLU KURALLAR
 
 pub fn plan_prompt(
     vision: &str,
+    instructions: &str,
     tree: &str,
     completed: &[String],
     failures: &[String],
@@ -51,8 +52,17 @@ pub fn plan_prompt(
             .join("\n")
     };
 
+    let instructions_block = if instructions.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "KULLANICI GENEL TALİMATI / İSTEKLERİ\n================\n{}\n\n",
+            instructions.trim()
+        )
+    };
+
     format!(
-        r#"PROJE VİZYONU
+        r#"{instructions_block}PROJE VİZYONU
 ================
 {vision}
 
@@ -97,6 +107,7 @@ ZORUNLU KURALLAR
 
 pub fn coder_prompt(
     vision: &str,
+    instructions: &str,
     task: &PlanTask,
     current: Option<&str>,
     feedback: &str,
@@ -137,8 +148,17 @@ pub fn coder_prompt(
         )
     };
 
+    let instructions_block = if instructions.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "KULLANICI GENEL TALİMATI / İSTEKLERİ\n================\n{}\n\n",
+            instructions.trim()
+        )
+    };
+
     format!(
-        r#"PROJE VİZYONU (bağlam)
+        r#"{instructions_block}PROJE VİZYONU (bağlam)
 ================
 {vision}
 

@@ -327,6 +327,7 @@ function buildConfig() {
   return {
     projectPath: $("projectPath").value.trim(),
     vision: $("vision").value.trim(),
+    instructions: $("instructions").value.trim(),
     architect: providerConfig("arch"),
     coder: providerConfig("coder"),
     maxAttempts: Number($("maxAttempts").value) || 3,
@@ -461,6 +462,7 @@ function scheduleStats() {
 const PERSISTED_FIELDS = [
   "projectPath",
   "vision",
+  "instructions",
   "archApiKind",
   "archBaseUrl",
   "archIdeKind",
