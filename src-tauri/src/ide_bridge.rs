@@ -74,12 +74,40 @@ pub fn resolve_program(kind: IdeKind) -> String {
             "~/.claude/local/claude",
             "~/.local/bin/claude",
             "/usr/local/bin/claude",
+            "/usr/bin/claude",
         ],
-        IdeKind::CursorAgent => &["~/.local/bin/cursor-agent", "/usr/local/bin/cursor-agent"],
+        IdeKind::CursorAgent => &[
+            "~/.local/bin/cursor-agent",
+            "~/.local/bin/cursor",
+            "/usr/local/bin/cursor-agent",
+            "/usr/local/bin/cursor",
+            "/usr/bin/cursor",
+            "/opt/Cursor/cursor",
+        ],
         _ => &[],
     };
 
     let home = std::env::var("HOME").unwrap_or_default();
+
+    // Check special directories like Claude Code's nested install: ~/.config/Claude/claude-code/*/*/claude
+    if kind == IdeKind::ClaudeCode && !home.is_empty() {
+        let claude_base = Path::new(&home).join(".config/Claude/claude-code");
+        if claude_base.is_dir() {
+            if let Ok(versions) = std::fs::read_dir(&claude_base) {
+                for v in versions.flatten() {
+                    if let Ok(hashes) = std::fs::read_dir(v.path()) {
+                        for h in hashes.flatten() {
+                            let bin = h.path().join("claude");
+                            if bin.is_file() {
+                                return bin.to_string_lossy().to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for candidate in candidates {
         let path = match candidate.strip_prefix("~/") {
             Some(rest) if !home.is_empty() => format!("{home}/{rest}"),
@@ -581,5 +609,12 @@ mod tests {
             ..Default::default()
         };
         assert!(IdeBridgeProvider::new(&cfg, std::path::Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn resolves_claude_binary_on_system() {
+        let bin = resolve_program(IdeKind::ClaudeCode);
+        println!("Resolved Claude: {}", bin);
+        assert!(!bin.is_empty());
     }
 }

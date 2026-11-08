@@ -157,7 +157,14 @@ async fn ide_catalog(cfg: &ProviderConfig, project_dir: &Path) -> Result<ModelCa
             }
         }
         IdeKind::ClaudeCode => {
-            // Claude Code does not expose a model list; these aliases are stable.
+            let bin = crate::ide_bridge::resolve_program(IdeKind::ClaudeCode);
+            let exists = !bin.is_empty() && Path::new(&bin).is_file();
+            let note = if exists {
+                format!("Claude CLI bulundu: {bin}. (Boş bırakırsan CLI varsayılanı)")
+            } else {
+                "Claude CLI bulunamadı. Kurulumdan sonra `CLAUDE_BIN` ortam değişkeniyle yolunu belirtebilirsin.".into()
+            };
+
             let models = ["sonnet", "opus", "haiku"]
                 .iter()
                 .map(|alias| ModelInfo {
@@ -167,24 +174,41 @@ async fn ide_catalog(cfg: &ProviderConfig, project_dir: &Path) -> Result<ModelCa
                 })
                 .collect();
             Ok(ModelCatalog {
-                note: "Claude Code model alias'ları. Boş bırakırsan CLI varsayılanı kullanılır.".into(),
+                note,
                 models,
                 source: "static".into(),
             })
         }
         IdeKind::CursorAgent => {
             let program = crate::ide_bridge::resolve_program(IdeKind::CursorAgent);
-            match cli_models(&program, &["models"], project_dir).await {
-                Ok(models) if !models.is_empty() => Ok(ModelCatalog {
-                    note: format!("{program} models · {} model", models.len()),
-                    models,
-                    source: "cli".into(),
-                }),
-                _ => Ok(empty_catalog(
-                    "cli",
-                    "Cursor Agent model listesi alınamadı. Boş bırakırsan CLI varsayılanı kullanılır.",
-                )),
-            }
+            let exists = !program.is_empty() && Path::new(&program).is_file();
+
+            let models = [
+                "claude-3-7-sonnet",
+                "claude-3-5-sonnet",
+                "gpt-4o",
+                "o3-mini",
+                "cursor-small",
+            ]
+            .iter()
+            .map(|id| ModelInfo {
+                id: (*id).to_string(),
+                name: (*id).to_string(),
+                context: None,
+            })
+            .collect();
+
+            let note = if exists {
+                format!("Cursor bulundu: {program}. (Boş bırakırsan varsayılan kullanılır)")
+            } else {
+                "Cursor CLI bulunamadı. Kurulumdan sonra `CURSOR_AGENT_BIN` ile tam yolu girebilirsin.".into()
+            };
+
+            Ok(ModelCatalog {
+                note,
+                models,
+                source: "static".into(),
+            })
         }
         IdeKind::CustomCli => Ok(empty_catalog(
             "cli",
