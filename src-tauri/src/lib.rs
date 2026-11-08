@@ -217,6 +217,76 @@ async fn open_new_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoProfileResult {
+    pub vision: String,
+    pub instructions: String,
+}
+
+/// Automatically reads the project tree and key manifest/readme files, then
+/// asks the architect/selected provider to propose a vision and instructions.
+#[tauri::command]
+async fn analyze_project(
+    project_path: String,
+    config: ProviderConfig,
+) -> Result<AutoProfileResult, String> {
+    let raw = project_path.trim();
+    if raw.is_empty() {
+        return Err("Proje klasörü seçilmedi.".into());
+    }
+    let root = std::path::Path::new(raw);
+    if !root.is_dir() {
+        return Err(format!("Proje klasörü bulunamadı: {raw}"));
+    }
+    let canonical = root
+        .canonicalize()
+        .map_err(|e| format!("Klasör açılamadı: {e}"))?;
+
+    let overview = workspace::read_project_overview(&canonical).await;
+    let provider = provider::build(&config, &canonical, "Mimar")?;
+
+    let system_prompt = r#"Sen kıdemli bir yazılım mimarısın. Verilen proje dosya ağacı ve ana dosyaları inceleyerek projeyi otonom yönetecek multi-agent sistemi için iki metin hazırla.
+1. VİZYON (vision): Projenin ne olduğunu, teknolojilerini, mimarisini, amaçlarını anlatan 2-4 cümlelik net ve zengin bir vizyon paragrafı.
+2. GENEL TALİMATLAR (instructions): Projede kod yazarken dikkat edilecek hayati kurallar, mimari prensipler, korunan kütüphaneler ve test doğrulama adımları (madde imli • şeklinde).
+
+Yanıtını YALNIZCA şu JSON formatında ver, başka hiçbir metin veya markdown bloğu yazma:
+{"vision": "...", "instructions": "..."}"#;
+
+    let prompt = format!(
+        "Aşağıdaki proje özetini incele ve JSON formatında vision ve instructions üret:\n\n{}",
+        overview
+    );
+
+    let raw_reply = provider.complete(&prompt, system_prompt).await?;
+    if let Some(val) = protocol::extract_json(&raw_reply) {
+        let vision = val
+            .get("vision")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let instructions = val
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !vision.is_empty() {
+            return Ok(AutoProfileResult {
+                vision,
+                instructions,
+            });
+        }
+    }
+
+    Ok(AutoProfileResult {
+        vision: raw_reply.trim().chars().take(1200).collect(),
+        instructions: "• Kodlama standartlarını koru.\n• Her adımda derleme ve testleri doğrula."
+            .into(),
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let shared: SharedState = Arc::new(Mutex::new(AppState::default()));
@@ -232,7 +302,8 @@ pub fn run() {
             get_stats,
             check_provider,
             list_models,
-            open_new_window
+            open_new_window,
+            analyze_project
         ])
         .run(tauri::generate_context!())
         .expect("Tauri uygulaması başlatılamadı");

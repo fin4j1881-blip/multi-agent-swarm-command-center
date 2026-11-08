@@ -50,7 +50,44 @@ pub struct WriteReport {
     pub dry_run: bool,
 }
 
-/// Normalizes an LLM supplied relative path and rejects escapes.
+/// Scans key files in the project root to generate a summary bundle for AI auto-profiling.
+pub async fn read_project_overview(root: &Path) -> String {
+    let mut out = String::new();
+
+    // 1. Project tree (top 70 files)
+    let tree = scan_tree(root, 70);
+    out.push_str("PROJE DOSYA AĞACI:\n");
+    out.push_str(&tree);
+    out.push_str("\n\n");
+
+    // 2. Read key informational and manifest files
+    let key_files = &[
+        "README.md",
+        "README",
+        "Cargo.toml",
+        "package.json",
+        "go.mod",
+        "pyproject.toml",
+        "requirements.txt",
+        "pom.xml",
+        "build.gradle",
+        "wrangler.jsonc",
+        "wrangler.toml",
+        "Makefile",
+        "AGENTS.md",
+        "CHANGELOG.md",
+    ];
+
+    for file in key_files {
+        if let Ok(res) = read_text(root, file, 6000).await {
+            if !res.text.trim().is_empty() {
+                out.push_str(&format!("--- DOSYA: {file} ---\n{}\n\n", res.text.trim()));
+            }
+        }
+    }
+
+    out
+}
 pub fn normalize_rel(rel: &str) -> Result<String, String> {
     let cleaned = rel
         .trim()

@@ -586,9 +586,15 @@ function renderProjectSidebar() {
       <div class="p-name">
         <span class="p-dot" title="${isRunning ? "Çalışıyor" : "Boşta"}"></span>
         <span>${shortName}</span>
+        <button class="p-delete-btn" type="button" title="Projeyi Arayüzden Kaldır">×</button>
       </div>
       <div class="p-path" title="${path}">${path}</div>
     `;
+
+    item.querySelector(".p-delete-btn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      removeProjectFromUi(path);
+    });
 
     item.addEventListener("click", () => {
       if (path !== $("projectPath").value.trim()) {
@@ -597,6 +603,78 @@ function renderProjectSidebar() {
     });
 
     listEl.appendChild(item);
+  }
+}
+
+function removeProjectFromUi(path) {
+  const isRunning = Boolean(projectRunningMap[path]);
+  if (isRunning) {
+    toast("Çalışan proje kaldırılamaz. Önce durdurun.", "error");
+    return;
+  }
+
+  const pKey = projectStorageKey(path);
+  if (pKey) {
+    try {
+      localStorage.removeItem(pKey);
+    } catch {}
+  }
+
+  const currentPath = $("projectPath").value.trim();
+  if (currentPath === path) {
+    const remaining = getKnownProjects().filter((p) => p !== path);
+    if (remaining.length > 0) {
+      switchProject(remaining[0]);
+    } else {
+      $("projectPath").value = "";
+      $("vision").value = "";
+      $("visionCount").textContent = "0";
+      $("instructions").value = "";
+      clearConsole();
+      applyStats({});
+      setRunning(false);
+      renderProjectSidebar();
+      persist();
+    }
+  } else {
+    renderProjectSidebar();
+  }
+
+  toast("Proje arayüzden kaldırıldı (dosyalarınıza dokunulmadı).", "ok");
+}
+
+async function triggerAiProjectAnalysis() {
+  const currentPath = $("projectPath").value.trim();
+  if (!currentPath) {
+    toast("Önce bir proje klasörü seçmelisiniz.", "error");
+    return;
+  }
+
+  const btn = $("aiAnalyzeBtn");
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "✨ Taranıyor…";
+
+  try {
+    const res = await invoke("analyze_project", {
+      projectPath: currentPath,
+      config: providerConfig("arch"),
+    });
+
+    if (res.vision) {
+      $("vision").value = res.vision;
+      $("visionCount").textContent = `${res.vision.trim().length}`;
+    }
+    if (res.instructions) {
+      $("instructions").value = res.instructions;
+    }
+    persist();
+    toast("Proje başarıyla analiz edildi! Vizyon ve talimatlar dolduruldu.", "ok");
+  } catch (err) {
+    toast(`AI analizi başarısız: ${err}`, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
   }
 }
 
@@ -708,8 +786,19 @@ async function pickFolder() {
     const folder = await invoke("select_folder");
     if (folder) {
       $("projectPath").value = folder;
-      loadProjectData(folder);
-      persist();
+      const pKey = projectStorageKey(folder);
+      const hasExisting = pKey && localStorage.getItem(pKey);
+
+      if (hasExisting) {
+        loadProjectData(folder);
+        persist();
+        renderProjectSidebar();
+      } else {
+        // Yeni bir proje eklendi! Otomatik AI analizi teklif et ve çalıştır
+        renderProjectSidebar();
+        persist();
+        triggerAiProjectAnalysis();
+      }
     }
   } catch (error) {
     toast(`Klasör seçilemedi: ${error}`, "error");
@@ -799,6 +888,9 @@ function bind() {
   $("pickFolderBtn").addEventListener("click", pickFolder);
   $("startBtn").addEventListener("click", start);
   $("stopBtn").addEventListener("click", stop);
+
+  const aiAnalyzeBtn = $("aiAnalyzeBtn");
+  if (aiAnalyzeBtn) aiAnalyzeBtn.addEventListener("click", triggerAiProjectAnalysis);
 
   const newWindowHandler = async () => {
     try {
