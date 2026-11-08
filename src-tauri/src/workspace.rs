@@ -37,6 +37,8 @@ const SKIP_EXTS: &[&str] = &[
     "lock", "bin", "dat", "pdb", "map",
 ];
 
+const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
+
 const ALLOWED_DOT_DIRS: &[&str] = &[".github", ".vscode", ".config"];
 
 #[derive(Debug, Clone)]
@@ -77,7 +79,8 @@ pub fn normalize_rel(rel: &str) -> Result<String, String> {
     }
 
     let lower = cleaned.to_lowercase();
-    if lower == ".git" || lower.starts_with(".git/") {
+    // Any `.git` component, so nested repositories and submodules are protected too.
+    if lower.split('/').any(|part| part == ".git") {
         return Err("Güvenlik: `.git` dizinine yazılamaz.".into());
     }
     if lower == ".swarm" || lower.starts_with(".swarm/") {
@@ -145,17 +148,97 @@ pub fn scan_tree(root: &Path, max_entries: usize) -> String {
     }
 }
 
-pub async fn read_text(root: &Path, rel: &str, max_chars: usize) -> Result<String, String> {
+/// File content as seen by the models.
+pub struct FileText {
+    pub text: String,
+    /// True when the file was longer than the requested limit.
+    pub truncated: bool,
+}
+
+pub async fn read_text(root: &Path, rel: &str, max_chars: usize) -> Result<FileText, String> {
     let path = safe_join(root, rel)?;
     ensure_inside(root, &path).await?;
+
+    let size = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| format!("`{rel}` okunamadı: {e}"))?
+        .len();
+    if size > MAX_READ_BYTES {
+        return Err(format!("`{rel}` çok büyük (>4 MB), atlandı."));
+    }
+
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|e| format!("`{rel}` okunamadı: {e}"))?;
-    if bytes.len() > 4 * 1024 * 1024 {
-        return Err(format!("`{rel}` çok büyük (>4 MB), atlandı."));
+    let text = String::from_utf8_lossy(&bytes);
+    match text.char_indices().nth(max_chars) {
+        None => Ok(FileText {
+            text: text.into_owned(),
+            truncated: false,
+        }),
+        Some((cut, _)) => Ok(FileText {
+            text: text[..cut].to_string(),
+            truncated: true,
+        }),
     }
-    let text = String::from_utf8_lossy(&bytes).to_string();
-    Ok(truncate_chars(&text, max_chars))
+}
+
+/// Like [`read_text`], but a missing file is `Ok(None)` (a new file) while any
+/// other failure stays an error, so an unreadable file is never mistaken for
+/// a new one and overwritten.
+pub async fn read_existing(
+    root: &Path,
+    rel: &str,
+    max_chars: usize,
+) -> Result<Option<FileText>, String> {
+    let path = safe_join(root, rel)?;
+    match tokio::fs::metadata(&path).await {
+        Ok(_) => read_text(root, rel, max_chars).await.map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("`{rel}` okunamadı: {e}")),
+    }
+}
+
+/// Reads up to `max_files` extra files the architect flagged as relevant and
+/// renders them as one prompt block. Unreadable files are skipped silently.
+pub async fn read_context_files(
+    root: &Path,
+    files: &[String],
+    skip: &str,
+    max_files: usize,
+    chars_each: usize,
+) -> String {
+    let mut block = String::new();
+    let mut taken = 0usize;
+
+    for raw in files {
+        if taken >= max_files {
+            break;
+        }
+        let Ok(rel) = normalize_rel(raw) else {
+            continue;
+        };
+        if rel == skip {
+            continue;
+        }
+        let Ok(file) = read_text(root, &rel, chars_each).await else {
+            continue;
+        };
+        if file.text.trim().is_empty() {
+            continue;
+        }
+        taken += 1;
+        let note = if file.truncated {
+            " (kısaltıldı)"
+        } else {
+            ""
+        };
+        block.push_str(&format!(
+            "BAĞLAM DOSYASI `{rel}`{note} — yalnızca okuma amaçlı\n---8<---\n{}\n---8<---\n\n",
+            file.text
+        ));
+    }
+    block
 }
 
 /// Writes the file atomically enough for an editor to pick up the change, after
@@ -229,7 +312,7 @@ pub async fn write_text(
         backup = Some(backup_path);
     }
 
-    tokio::fs::write(&path, body.as_bytes())
+    write_atomic(&path, body.as_bytes())
         .await
         .map_err(|e| format!("`{cleaned}` yazılamadı: {e}"))?;
 
@@ -240,6 +323,31 @@ pub async fn write_text(
         created: !existed,
         dry_run: false,
     })
+}
+
+/// Writes through a sibling temp file and renames it over the target, so an
+/// editor or a crash never observes a half-written file. Permissions of an
+/// existing target are carried over.
+async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let tmp = path.with_file_name(format!(".{file_name}.swarm-tmp-{}", std::process::id()));
+
+    let result = async {
+        tokio::fs::write(&tmp, bytes).await?;
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            let _ = tokio::fs::set_permissions(&tmp, meta.permissions()).await;
+        }
+        tokio::fs::rename(&tmp, path).await
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
 }
 
 pub async fn restore(root: &Path, rel: &str, backup: &Path) -> Result<(), String> {
@@ -321,14 +429,6 @@ async fn ensure_inside(root: &Path, path: &Path) -> Result<(), String> {
     }
 }
 
-pub fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let cut: String = text.chars().take(max).collect();
-    format!("{cut}\n… (kısaltıldı)")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +470,74 @@ mod tests {
         assert!(normalize_rel(".swarm/backups/x").is_err());
         assert!(normalize_rel("src/../../x").is_err());
         assert!(normalize_rel("   ").is_err());
+    }
+
+    #[test]
+    fn nested_git_dirs_are_protected() {
+        assert!(normalize_rel("vendor/lib/.git/config").is_err());
+        assert!(normalize_rel("src/.github/workflows/ci.yml").is_ok());
+    }
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("swarm-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn write_is_atomic_backs_up_and_leaves_no_temp_files() {
+        let root = temp_root("atomic");
+        write_text(&root, "a.txt", "eski", false).await.unwrap();
+        let report = write_text(&root, "a.txt", "yeni", false).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "yeni\n"
+        );
+        let backup = report.backup.expect("backup of the old version");
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), "eski\n");
+        let leftovers = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("swarm-tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn read_existing_distinguishes_missing_from_truncated() {
+        let root = temp_root("read");
+        std::fs::write(root.join("big.txt"), "x".repeat(50)).unwrap();
+
+        assert!(read_existing(&root, "yok.txt", 100)
+            .await
+            .unwrap()
+            .is_none());
+
+        let full = read_existing(&root, "big.txt", 100).await.unwrap().unwrap();
+        assert!(!full.truncated);
+
+        let clipped = read_existing(&root, "big.txt", 10).await.unwrap().unwrap();
+        assert!(clipped.truncated);
+        assert_eq!(clipped.text.len(), 10);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn context_files_are_inlined_and_skip_the_target() {
+        let root = temp_root("ctx");
+        std::fs::write(root.join("b.rs"), "fn b() {}").unwrap();
+        std::fs::write(root.join("a.rs"), "fn a() {}").unwrap();
+        let files = vec![
+            "a.rs".to_string(),
+            "b.rs".to_string(),
+            "../etc/passwd".to_string(),
+        ];
+
+        let block = read_context_files(&root, &files, "a.rs", 3, 100).await;
+        assert!(block.contains("fn b()"));
+        assert!(!block.contains("fn a()"));
+        std::fs::remove_dir_all(&root).ok();
     }
 }

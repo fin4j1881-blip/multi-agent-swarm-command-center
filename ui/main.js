@@ -52,7 +52,9 @@ function sourceFor(prefix) {
 
 function setSource(prefix, source) {
   document.querySelectorAll(`[data-seg="${prefix}"] .seg`).forEach((button) => {
-    button.classList.toggle("active", button.dataset.source === source);
+    const active = button.dataset.source === source;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
   });
   applyVisibility(prefix);
 
@@ -318,7 +320,7 @@ function providerConfig(prefix) {
     ideCommand: $(`${prefix}IdeCommand`).value.trim() || null,
     ideArgs: parseArgs($(`${prefix}IdeArgs`).value),
     temperature: 0.2,
-    maxTokens: 4096,
+    maxTokens: Number($("maxTokens").value) || 8192,
     timeoutSecs: $(`${prefix}IdeKind`).value === "claude_code" ? 900 : 600,
   };
 }
@@ -370,9 +372,7 @@ function renderEmptyState() {
   host.appendChild(wrap);
 }
 
-function addLog(event) {
-  removeEmptyState();
-
+function buildLogRow(event) {
   const row = document.createElement("div");
   row.className = `log ${event.level || "info"}`;
 
@@ -402,18 +402,27 @@ function addLog(event) {
   }
 
   row.append(time, phase, msg);
-  consoleEl().appendChild(row);
+  return row;
+}
 
-  while (consoleEl().children.length > 600) {
-    consoleEl().firstElementChild?.remove();
+/* Appends a batch with a single DOM insertion and a single scroll, so replaying
+   the backend's log history does not force one layout per line. */
+function addLogs(events) {
+  if (!events?.length) return;
+  removeEmptyState();
+
+  const host = consoleEl();
+  const fragment = document.createDocumentFragment();
+  for (const event of events) {
+    fragment.appendChild(buildLogRow(event));
+    state.logs.push(event);
   }
+  host.appendChild(fragment);
 
-  state.logs.push(event);
+  while (host.children.length > 600) host.firstElementChild?.remove();
   if (state.logs.length > 1200) state.logs.splice(0, state.logs.length - 1200);
 
-  if ($("autoscroll").checked) {
-    consoleEl().scrollTop = consoleEl().scrollHeight;
-  }
+  if ($("autoscroll").checked) host.scrollTop = host.scrollHeight;
 }
 
 function clearConsole() {
@@ -434,11 +443,17 @@ function setRunning(running) {
   $("footStatus").textContent = running ? "Ajan döngüsü aktif" : "Bekliyor";
 }
 
+function updateFootHint() {
+  const attempts = Number($("maxAttempts").value) || 3;
+  $("footHint").textContent = `Yalnızca onaylanan dosyalar yazılır · görev başına maks. ${attempts} deneme`;
+}
+
 function applyStats(stats) {
   if (!stats) return;
   $("statRound").textContent = stats.rounds ?? 0;
   $("statApplied").textContent = stats.tasksApplied ?? 0;
   $("statRejected").textContent = stats.tasksRejected ?? 0;
+  $("statSkipped").textContent = stats.tasksSkipped ?? 0;
   $("statRevisions").textContent = stats.revisions ?? 0;
   $("statFiles").textContent = stats.filesWritten ?? 0;
 }
@@ -448,7 +463,8 @@ function scheduleStats() {
   state.statsTimer = setTimeout(async () => {
     state.statsTimer = null;
     try {
-      const status = await invoke("get_status");
+      // get_stats carries no log history, unlike get_status.
+      const status = await invoke("get_stats");
       applyStats(status.stats);
       if (status.running !== state.running) setRunning(status.running);
     } catch {
@@ -479,6 +495,7 @@ const PERSISTED_FIELDS = [
   "maxRounds",
   "maxTasks",
   "contextChars",
+  "maxTokens",
 ];
 
 function persist() {
@@ -494,11 +511,32 @@ function persist() {
       data.dryRun = $("dryRun").checked;
       data.verifyBuild = $("verifyBuild").checked;
       data.autoscroll = $("autoscroll").checked;
+      data.models = {};
+      for (const prefix of ["arch", "coder"]) {
+        data.models[prefix] = {
+          api: effectiveModel(prefix, "api"),
+          apiFallback: $(`${prefix}FallbackModel`).value,
+          ide: effectiveModel(prefix, "ide"),
+          ideFallback: $(`${prefix}IdeFallbackModel`).value,
+        };
+      }
       localStorage.setItem("swarm.settings.v1", JSON.stringify(data));
     } catch {
       /* storage unavailable */
     }
   }, 300);
+}
+
+function setSelectValue(select, value) {
+  if (!select || !value) return;
+  if (!Array.from(select.options).some((option) => option.value === value)) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    const custom = Array.from(select.options).find((o) => o.value === "__custom__");
+    select.insertBefore(option, custom || null);
+  }
+  select.value = value;
 }
 
 function restore() {
@@ -517,6 +555,17 @@ function restore() {
   if (typeof data.dryRun === "boolean") $("dryRun").checked = data.dryRun;
   if (typeof data.verifyBuild === "boolean") $("verifyBuild").checked = data.verifyBuild;
   if (typeof data.autoscroll === "boolean") $("autoscroll").checked = data.autoscroll;
+
+  /* Model lists are fetched on demand, so put the remembered choice into the
+     (still empty) selects; fillModelSelect keeps it when the list arrives. */
+  for (const prefix of ["arch", "coder"]) {
+    const saved = data.models?.[prefix];
+    if (!saved) continue;
+    setSelectValue($(`${prefix}Model`), saved.api);
+    setSelectValue($(`${prefix}FallbackModel`), saved.apiFallback);
+    setSelectValue($(`${prefix}IdeModel`), saved.ide);
+    setSelectValue($(`${prefix}IdeFallbackModel`), saved.ideFallback);
+  }
 
   if (data.source?.arch) {
     document.querySelectorAll('[data-seg="arch"] .seg').forEach((button) => {
@@ -587,7 +636,7 @@ async function start() {
 
   $("startBtn").disabled = true;
   clearConsole();
-  applyStats({ rounds: 0, tasksApplied: 0, tasksRejected: 0, revisions: 0, filesWritten: 0 });
+  applyStats({});
 
   try {
     const root = await invoke("start_command_center", { config });
@@ -596,6 +645,14 @@ async function start() {
   } catch (error) {
     $("startBtn").disabled = false;
     toast(String(error), "error");
+    // A rejected start (e.g. "already running") must not leave the console wiped.
+    try {
+      const status = await invoke("get_status");
+      clearConsole();
+      addLogs(status.logs);
+    } catch {
+      /* keep the empty console */
+    }
   }
 }
 
@@ -743,9 +800,11 @@ async function bootstrap() {
     applyApiDefaults(prefix, false);
   }
   $("visionCount").textContent = `${$("vision").value.trim().length}`;
+  updateFootHint();
+  $("maxAttempts").addEventListener("input", updateFootHint);
 
   await listen("agent-log", (event) => {
-    addLog(event.payload);
+    addLogs([event.payload]);
     scheduleStats();
   });
 
@@ -759,9 +818,8 @@ async function bootstrap() {
     applyStats(status.stats);
     setRunning(status.running);
     if (status.logs?.length) {
-      removeEmptyState();
       state.logs = [];
-      status.logs.forEach(addLog);
+      addLogs(status.logs);
     }
   } catch (error) {
     toast(`Durum okunamadı: ${error}`, "warn");

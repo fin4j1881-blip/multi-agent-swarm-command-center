@@ -4,6 +4,7 @@
 //! The parsers therefore accept JSON, fenced JSON and the `### FILE:` markdown
 //! protocol, and fail loudly with a useful preview when nothing matches.
 
+use crate::util::snippet;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -18,12 +19,36 @@ pub struct PlanTask {
     pub file: String,
     #[serde(default)]
     pub objective: String,
-    #[serde(default, alias = "acceptanceCriteria", alias = "criteria")]
+    // The architect prompt documents snake_case keys, so accept both spellings.
+    #[serde(
+        default,
+        alias = "acceptance_criteria",
+        alias = "criteria",
+        deserialize_with = "string_list"
+    )]
     pub acceptance_criteria: Vec<String>,
-    #[serde(default, alias = "contextFiles")]
+    #[serde(default, alias = "context_files", deserialize_with = "string_list")]
     pub context_files: Vec<String>,
     #[serde(default)]
     pub notes: String,
+}
+
+/// Accepts `["a","b"]`, a single `"a"` or `null`; models are sloppy about this.
+fn string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Value::deserialize(deserializer)? {
+        Value::String(text) if !text.trim().is_empty() => vec![text],
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                Value::String(text) if !text.trim().is_empty() => Some(text),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 impl PlanTask {
@@ -146,7 +171,7 @@ fn balanced_slice(raw: &str, start: usize) -> Option<&str> {
 
 pub fn parse_plan(raw: &str) -> Result<Plan, String> {
     let value = extract_json(raw)
-        .ok_or_else(|| format!("Komutan geçerli JSON üretmedi: {}", preview(raw)))?;
+        .ok_or_else(|| format!("Komutan geçerli JSON üretmedi: {}", snippet(raw, 400)))?;
 
     let mut plan: Plan = if value.is_array() {
         Plan {
@@ -180,6 +205,16 @@ pub fn parse_plan(raw: &str) -> Result<Plan, String> {
 }
 
 pub fn parse_proposal(raw: &str, fallback_file: &str) -> Result<Proposal, String> {
+    // The documented protocol is markdown. When its header is present it wins,
+    // otherwise a JSON file being *written* (which may itself contain a
+    // `content` key) could be mistaken for a JSON envelope.
+    let has_header = find_header(raw, &["### FILE:", "## FILE:", "FILE:"]).is_some();
+    if has_header {
+        if let Ok(proposal) = parse_markdown_proposal(raw, fallback_file) {
+            return Ok(proposal);
+        }
+    }
+
     if let Some(value) = extract_json(raw) {
         let content = value
             .get("content")
@@ -192,10 +227,9 @@ pub fn parse_proposal(raw: &str, fallback_file: &str) -> Result<Proposal, String
                     .get("file")
                     .or_else(|| value.get("path"))
                     .and_then(Value::as_str)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| fallback_file.to_string());
+                    .unwrap_or(fallback_file);
                 return Ok(Proposal {
-                    file: normalize_file(&file, fallback_file),
+                    file: normalize_file(file, fallback_file),
                     summary: value
                         .get("summary")
                         .and_then(Value::as_str)
@@ -207,12 +241,16 @@ pub fn parse_proposal(raw: &str, fallback_file: &str) -> Result<Proposal, String
         }
     }
 
+    parse_markdown_proposal(raw, fallback_file)
+}
+
+fn parse_markdown_proposal(raw: &str, fallback_file: &str) -> Result<Proposal, String> {
     let file = find_header(raw, &["### FILE:", "## FILE:", "FILE:"])
         .unwrap_or_else(|| fallback_file.to_string());
     let summary =
         find_header(raw, &["### SUMMARY:", "## SUMMARY:", "SUMMARY:"]).unwrap_or_default();
-    let (_, content) =
-        extract_fence(raw).ok_or_else(|| format!("İşçi kod bloğu üretmedi: {}", preview(raw)))?;
+    let content = extract_fence(raw)
+        .ok_or_else(|| format!("İşçi kod bloğu üretmedi: {}", snippet(raw, 400)))?;
 
     Ok(Proposal {
         file: normalize_file(&file, fallback_file),
@@ -225,21 +263,17 @@ pub fn parse_verdict(raw: &str) -> Verdict {
     if let Some(value) = extract_json(raw) {
         let approved = value
             .get("approved")
-            .and_then(Value::as_bool)
+            .and_then(|v| match v {
+                Value::Bool(b) => Some(*b),
+                Value::String(text) => Some(text.trim().eq_ignore_ascii_case("true")),
+                _ => None,
+            })
             .or_else(|| {
                 value
                     .get("verdict")
                     .or_else(|| value.get("decision"))
                     .and_then(Value::as_str)
-                    .map(|text| {
-                        let lower = text.to_lowercase();
-                        (lower.contains("approve")
-                            || lower.contains("onay")
-                            || lower.contains("accept")
-                            || lower.contains("pass"))
-                            && !lower.contains("reject")
-                            && !lower.contains("red")
-                    })
+                    .map(|text| text_says_approved(&text.to_lowercase(), true))
             })
             .unwrap_or(false);
 
@@ -262,7 +296,7 @@ pub fn parse_verdict(raw: &str) -> Verdict {
             score: value
                 .get("score")
                 .and_then(Value::as_f64)
-                .map(|s| s as f32)
+                .map(|s| s.clamp(0.0, 10.0) as f32)
                 .unwrap_or(if approved { 8.0 } else { 0.0 }),
             summary: value
                 .get("summary")
@@ -280,29 +314,50 @@ pub fn parse_verdict(raw: &str) -> Verdict {
         };
     }
 
-    let lower = raw.to_lowercase();
-    let rejected = ["reject", "redded", "revizyon", "ret edil"]
-        .iter()
-        .any(|needle| lower.contains(needle));
-    let approved = ["approve", "onay", "lgtm", "kabul"]
-        .iter()
-        .any(|needle| lower.contains(needle));
-
+    // Free text: anything ambiguous or negated counts as a rejection.
+    let approved = text_says_approved(&raw.to_lowercase(), false);
     Verdict {
-        approved: approved && !rejected,
-        score: if approved && !rejected { 7.0 } else { 0.0 },
-        summary: preview(raw),
-        issues: if rejected {
-            vec![preview(raw)]
-        } else {
+        approved,
+        score: if approved { 7.0 } else { 0.0 },
+        summary: snippet(raw, 400),
+        issues: if approved {
             Vec::new()
+        } else {
+            vec![snippet(raw, 400)]
         },
-        revision: if approved && !rejected {
+        revision: if approved {
             String::new()
         } else {
-            preview(raw)
+            snippet(raw, 400)
         },
     }
+}
+
+/// `lower` must already be lower-cased. `short_field` is true for a dedicated
+/// `verdict`/`decision` value ("accepted", "pass"); in free prose only explicit
+/// approvals count, because words like "kabul kriterleri" show up in rejections.
+fn text_says_approved(lower: &str, short_field: bool) -> bool {
+    const NEGATIVE: &[&str] = &[
+        "reject",
+        "redded",
+        "reddet",
+        "revizyon",
+        "ret edil",
+        "not approv",
+        "disapprov",
+        "onaylanmad",
+        "onaylamıyor",
+        "onaylamiyor",
+        "not accept",
+        "kabul edilemez",
+        "fail",
+    ];
+    const STRONG: &[&str] = &["approve", "lgtm", "onaylandı", "onaylıyorum", "onayladı"];
+    const WEAK: &[&str] = &["onay", "accept", "kabul", "pass"];
+
+    !NEGATIVE.iter().any(|needle| lower.contains(needle))
+        && (STRONG.iter().any(|needle| lower.contains(needle))
+            || (short_field && WEAK.iter().any(|needle| lower.contains(needle))))
 }
 
 fn normalize_file(candidate: &str, fallback: &str) -> String {
@@ -334,49 +389,43 @@ fn find_header(raw: &str, prefixes: &[&str]) -> Option<String> {
     None
 }
 
-/// Returns the longest fenced code block: `(language, content)`.
-fn extract_fence(raw: &str) -> Option<(String, String)> {
-    let mut best: Option<(String, String)> = None;
-    let mut search_from = 0usize;
+/// Returns the body of the longest fenced code block.
+///
+/// Fences are matched by length, so a ```` outer fence may safely contain
+/// ``` blocks (typical when the generated file is itself markdown). A closing
+/// fence must sit on its own line.
+fn extract_fence(raw: &str) -> Option<String> {
+    let mut best: Option<String> = None;
+    // (fence length, collected body lines)
+    let mut open: Option<(usize, Vec<&str>)> = None;
 
-    while let Some(open_rel) = raw[search_from..].find("```") {
-        let open = search_from + open_rel;
-        let after_open = &raw[open + 3..];
-        let newline = match after_open.find('\n') {
-            Some(pos) => pos,
-            None => break,
-        };
-        let language = after_open[..newline].trim().to_string();
-        let body_start = open + 3 + newline + 1;
-        let rest = &raw[body_start..];
-        let close_rel = match rest.find("```") {
-            Some(pos) => pos,
-            None => break,
-        };
-        let content = rest[..close_rel].trim_end().to_string();
-        if !content.trim().is_empty() {
-            let better = best
-                .as_ref()
-                .map(|(_, current)| content.len() > current.len())
-                .unwrap_or(true);
-            if better {
-                best = Some((language, content));
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        let ticks = trimmed.chars().take_while(|c| *c == '`').count();
+
+        match open.as_mut() {
+            None => {
+                if ticks >= 3 {
+                    open = Some((ticks, Vec::new()));
+                }
+            }
+            Some((fence_len, body)) => {
+                if ticks >= *fence_len && trimmed.len() == ticks {
+                    let content = body.join("\n").trim_end().to_string();
+                    let better = !content.trim().is_empty()
+                        && best.as_ref().map_or(true, |b| content.len() > b.len());
+                    if better {
+                        best = Some(content);
+                    }
+                    open = None;
+                } else {
+                    body.push(line);
+                }
             }
         }
-        search_from = body_start + close_rel + 3;
     }
 
     best
-}
-
-fn preview(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let cut: String = trimmed.chars().take(400).collect();
-    if trimmed.chars().count() > 400 {
-        format!("{cut}…")
-    } else {
-        cut
-    }
 }
 
 #[cfg(test)]
@@ -452,5 +501,63 @@ Uygulayabiliriz."#;
         let raw = r#"öncesi {"a":"} { içinde","b":{"c":1}} sonrası"#;
         let value = extract_json(raw).expect("json");
         assert_eq!(value["b"]["c"], 1);
+    }
+
+    #[test]
+    fn plan_accepts_snake_case_keys_from_the_documented_schema() {
+        let raw = r#"{"status":"continue","tasks":[{"id":"T1","title":"A","file":"a.rs",
+            "objective":"x","acceptance_criteria":["derlenir"],"context_files":["Cargo.toml"]}]}"#;
+        let plan = parse_plan(raw).unwrap();
+        assert_eq!(plan.tasks[0].acceptance_criteria, vec!["derlenir"]);
+        assert_eq!(plan.tasks[0].context_files, vec!["Cargo.toml"]);
+    }
+
+    #[test]
+    fn plan_tolerates_string_instead_of_list() {
+        let raw =
+            r#"{"tasks":[{"file":"a.rs","acceptanceCriteria":"derlenir","contextFiles":null}]}"#;
+        let plan = parse_plan(raw).unwrap();
+        assert_eq!(plan.tasks[0].acceptance_criteria, vec!["derlenir"]);
+        assert!(plan.tasks[0].context_files.is_empty());
+    }
+
+    #[test]
+    fn longer_outer_fence_may_contain_inner_fences() {
+        let raw =
+            "### FILE: README.md\n````markdown\n# Başlık\n```bash\ncargo test\n```\nson\n````\n";
+        let proposal = parse_proposal(raw, "x.md").unwrap();
+        assert!(proposal.content.contains("```bash"));
+        assert!(proposal.content.ends_with("son"));
+    }
+
+    #[test]
+    fn unclosed_fence_is_a_failure_not_a_truncated_file() {
+        let raw = "### FILE: a.rs\n```rust\nfn main() {\n";
+        assert!(parse_proposal(raw, "a.rs").is_err());
+    }
+
+    #[test]
+    fn json_file_with_content_key_is_not_mistaken_for_an_envelope() {
+        let raw =
+            "### FILE: data.json\n```json\n{\"content\": \"merhaba dünya\", \"id\": 1}\n```\n";
+        let proposal = parse_proposal(raw, "data.json").unwrap();
+        assert!(proposal.content.contains("\"id\": 1"));
+    }
+
+    #[test]
+    fn negated_or_ambiguous_free_text_is_a_rejection() {
+        assert!(!parse_verdict("Bu öneriyi onaylamıyorum.").approved);
+        assert!(!parse_verdict("Not approved: missing import").approved);
+        assert!(!parse_verdict("Kabul kriterleri karşılanmıyor.").approved);
+        assert!(!parse_verdict("Belirsiz bir yanıt").approved);
+        assert!(parse_verdict("LGTM").approved);
+    }
+
+    #[test]
+    fn verdict_field_variants() {
+        assert!(parse_verdict(r#"{"verdict":"accepted"}"#).approved);
+        assert!(!parse_verdict(r#"{"verdict":"required changes"}"#).approved);
+        assert!(parse_verdict(r#"{"approved":"true","score":42}"#).approved);
+        assert_eq!(parse_verdict(r#"{"approved":true,"score":42}"#).score, 10.0);
     }
 }

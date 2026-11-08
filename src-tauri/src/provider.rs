@@ -48,7 +48,7 @@ impl FallbackProvider {
     pub fn is_fallback_error(err: &str) -> bool {
         let lower = err.to_lowercase();
         // HTTP status codes
-        lower.contains("429")
+        contains_code(&lower, "429")
             || lower.contains("too many requests")
             || lower.contains("rate limit")
             || lower.contains("rate_limit")
@@ -74,11 +74,20 @@ impl FallbackProvider {
             || lower.contains("context_length_exceeded")
             || lower.contains("token limit")
             // Gateway 503 / 504 / 502
-            || lower.contains("503")
-            || lower.contains("502")
-            || lower.contains("504")
+            || contains_code(&lower, "503")
+            || contains_code(&lower, "502")
+            || contains_code(&lower, "504")
             || lower.contains("temporarily unavailable")
     }
+}
+
+/// True if `code` appears as a standalone number (so "port 15029" is not a 502).
+fn contains_code(haystack: &str, code: &str) -> bool {
+    haystack.match_indices(code).any(|(start, _)| {
+        let before = haystack[..start].chars().next_back();
+        let after = haystack[start + code.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_digit()) && !after.is_some_and(|c| c.is_ascii_digit())
+    })
 }
 
 #[async_trait]
@@ -126,11 +135,7 @@ impl ModelProvider for FallbackProvider {
                     let has_next = i + 1 < total;
 
                     if is_recoverable && has_next {
-                        let next_label = self.providers[i + 1].label();
-                        eprintln!(
-                            "[fallback] {} modeli limiti/hatası: {} -> {} modeline geçiliyor",
-                            provider_label, err, next_label
-                        );
+                        // The orchestrator notices the label change and logs it.
                         self.current.store(i + 1, Ordering::Relaxed);
                         continue;
                     }
@@ -152,56 +157,49 @@ impl ModelProvider for FallbackProvider {
 }
 
 /// Builds the right provider (with fallback chain) for a role from its config.
-pub fn build(cfg: &ProviderConfig, project_dir: &Path) -> Result<Box<dyn ModelProvider>, String> {
-    let all = cfg.all_models();
-    let role_name = "Model";
+/// `role` only appears in error messages ("Komutan", "İşçi").
+pub fn build(
+    cfg: &ProviderConfig,
+    project_dir: &Path,
+    role: &str,
+) -> Result<Box<dyn ModelProvider>, String> {
+    let models = cfg.all_models();
 
-    match cfg.source {
+    let chain: Vec<Box<dyn ModelProvider>> = match cfg.source {
         ProviderSource::Api => {
-            if all.is_empty() {
-                let base = ApiProvider::new(cfg)?;
-                return Ok(Box::new(base));
+            let mut primary = cfg.clone();
+            if let Some(first) = models.first() {
+                primary.model = first.clone();
             }
-
-            let mut cfg_primary = cfg.clone();
-            cfg_primary.model = all[0].clone();
-            let base = ApiProvider::new(&cfg_primary)?;
-
-            if all.len() == 1 {
-                return Ok(Box::new(base));
-            }
-
-            let mut list: Vec<Box<dyn ModelProvider>> = Vec::with_capacity(all.len());
-            list.push(Box::new(base.clone()));
-            for m in &all[1..] {
-                list.push(Box::new(base.with_model(m)));
-            }
-
-            Ok(Box::new(FallbackProvider::new(role_name, list)?))
+            let base = ApiProvider::new(&primary)?;
+            let mut chain: Vec<Box<dyn ModelProvider>> = vec![Box::new(base.clone())];
+            chain.extend(
+                models
+                    .iter()
+                    .skip(1)
+                    .map(|m| Box::new(base.with_model(m)) as Box<dyn ModelProvider>),
+            );
+            chain
         }
         ProviderSource::Ide => {
-            if all.is_empty() {
-                let base = IdeBridgeProvider::new(cfg, project_dir)?;
-                return Ok(Box::new(base));
+            let mut primary = cfg.clone();
+            if let Some(first) = models.first() {
+                primary.model = first.clone();
             }
-
-            let mut cfg_primary = cfg.clone();
-            cfg_primary.model = all[0].clone();
-            let base = IdeBridgeProvider::new(&cfg_primary, project_dir)?;
-
-            if all.len() == 1 {
-                return Ok(Box::new(base));
+            let base = IdeBridgeProvider::new(&primary, project_dir)?;
+            let mut chain: Vec<Box<dyn ModelProvider>> = Vec::new();
+            for m in models.iter().skip(1) {
+                chain.push(Box::new(base.with_model(m)));
             }
-
-            let mut list: Vec<Box<dyn ModelProvider>> = Vec::with_capacity(all.len());
-            list.push(Box::new(base.with_model(&all[0])));
-            for m in &all[1..] {
-                list.push(Box::new(base.with_model(m)));
-            }
-
-            Ok(Box::new(FallbackProvider::new(role_name, list)?))
+            chain.insert(0, Box::new(base));
+            chain
         }
+    };
+
+    if chain.len() == 1 {
+        return Ok(chain.into_iter().next().expect("one provider"));
     }
+    Ok(Box::new(FallbackProvider::new(role, chain)?))
 }
 
 #[cfg(test)]
@@ -289,6 +287,9 @@ mod tests {
         ));
         assert!(!FallbackProvider::is_fallback_error(
             "Invalid JSON format in prompt"
+        ));
+        assert!(!FallbackProvider::is_fallback_error(
+            "bağlantı 127.0.0.1:15029 reddedildi"
         ));
     }
 }

@@ -48,7 +48,7 @@ Yerel guardrail: boş/kesik içerik, "..." yer tutucu, markdown sarmalı,
    ↓ (sorun yoksa)
 Komutan denetimi: {"approved": bool, "score": 0-10, "issues": [...], "revision": "..."}
    ↓ onay
-.swarm/backups/<zaman>/<dosya> yedeği → atomik tam dosya yazımı
+.swarm/backups/<zaman>/<dosya> yedeği → atomik tam dosya yazımı (geçici dosya + rename)
    ↓ (opsiyonel)
 cargo check → hata varsa dosya yedeğe geri alınır, revizyon istenir
 ```
@@ -78,7 +78,8 @@ Kod asla doğrudan diske yazılmaz; ret edilen öneri sadece log'da görünür.
 │       ├── guardrail.rs      # yerel, maliyetsiz ön denetim
 │       ├── prompts.rs        # Komutan / İşçi / denetçi prompt sözleşmeleri
 │       ├── protocol.rs       # JSON & markdown protokol parser'ları
-│       ├── workspace.rs      # güvenli path, ağaç tarama, yedek, yazma
+│       ├── workspace.rs      # güvenli path, ağaç tarama, yedek, atomik yazma
+│       ├── util.rs           # ortak metin yardımcıları
 │       └── state.rs          # AppState, log/event yayını
 ├── ui/
 │   ├── index.html
@@ -135,7 +136,7 @@ Uygulama boştayken ağ isteği, zamanlayıcı veya CPU döngüsü çalıştırm
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml --lib
-# 30 test: plan/proposal/verdict parser'ları, path güvenliği, guardrail, model listesi, fallback zinciri
+# 55 test: plan/proposal/verdict parser'ları, path güvenliği, atomik yazma, guardrail, model listesi, fallback zinciri
 ```
 
 ---
@@ -179,8 +180,12 @@ UI'da `Kaynak: API` seç, sağlayıcıyı belirle; **model adını elle yazmıyo
   ikinci bir yedek model seçilebilir. Birincil model kota/limit hatası verirse
   (HTTP 429, `insufficient_quota`, bakiye, context uzunluğu, 503 aşırı yük vb.),
   sistem otomatik olarak yedek modele geçer ve oturum boyunca oradan devam eder.
-- UI anahtarları `localStorage`'a **yazmaz**; pencere kapanınca unutulur. Model
-  seçimleri de oturumluktur; her açılışta liste yeniden çekilir.
+- UI anahtarları `localStorage`'a **yazmaz**; pencere kapanınca unutulur. Seçtiğin
+  model adları (ve yedek model) ise hatırlanır; liste ilk yenilemede güncellenir.
+- **Çıktı token sınırı** (Gelişmiş ayarlar, varsayılan 8192): İşçi dosyanın tamamını yazar.
+  Yanıt bu sınırda kesilirse (`finish_reason=length` / `stop_reason=max_tokens`) eksik
+  dosya diske yazılmaz, açık bir hata verilir.
+- Yedek model değişimi konsola `Model değişti: A → B` olarak yazılır.
 
 > İpucu: Komutan için güçlü bir model (Claude Sonnet, GPT-4.1, DeepSeek Chat),
 > İşçi için daha ucuz/hızlı bir model seçmek maliyeti düşürür.
@@ -204,10 +209,11 @@ UI: `IDE = OpenCode CLI`. Model açılır listeden seçilir (`opencode models` �
 otomatik dolar, `⟳` ile yenilenir). Boş bırakırsan CLI'nin varsayılanı kullanılır.
 Çalıştırılan komut: `opencode run [--model <model>] "<prompt>"`.
 
-Uygulama `opencode` komutunu PATH'te arar; bulamazsa bilinen kurulum yerlerini dener
+Uygulama komutu önce PATH'te arar; bulamazsa bilinen kurulum yerlerini dener
 (`/usr/lib/opencode-desktop/opencode-cli`, `~/.opencode/bin/opencode`,
 `~/.local/bin/opencode`, `/usr/local/bin/opencode`, `/snap/bin/opencode`).
-Farklı bir konumdaysa `OPENCODE_BIN=/tam/yol/opencode` ile başlat.
+Farklı bir konumdaysa `OPENCODE_BIN=/tam/yol/opencode` ile başlat
+(`CLAUDE_BIN`, `CURSOR_AGENT_BIN` aynı şekilde çalışır).
 
 #### Claude Code CLI
 
@@ -228,8 +234,10 @@ cursor-agent login
 cursor-agent -p "sadece OK yaz"
 ```
 
-UI: `IDE = Cursor Agent CLI`. Model listesi `cursor-agent models` çıktısından gelir;
-alınamazsa boş kalır ve CLI varsayılanı kullanılır. Prompt argüman olarak eklenir.
+UI: `IDE = Cursor Agent CLI`. Model listesi sabit bir listedir; boş bırakırsan CLI
+varsayılanı kullanılır. Prompt argüman olarak eklenir; işletim sistemi tek argüman için
+sınır koyar (Linux ~128 KB, Windows ~32 KB), aşılırsa açık bir hata verilir ve
+`Dosya bağlamı` küçültmen ya da stdin kullanan Claude Code'u seçmen önerilir.
 
 #### Custom CLI
 
@@ -292,7 +300,9 @@ tek yapman gereken, gelen `prompt`/`system` alanlarını o API'ye taşımak.
 Yerel ön denetim (API çağrısı harcamadan reddeder):
 
 - boş / 20 karakterden kısa içerik
-- `... existing code`, `// ...`, `TODO: implement`, `aynı kalır` gibi yer tutucular
+- `... existing code`, yalnızca `// ...` içeren satır, `// rest unchanged`, `aynı kalır` gibi yer tutucular
+  (dosyada zaten var olan ifadeler yeni sürümün aleyhine sayılmaz)
+- görevin dışında başka bir dosyaya yazma girişimi
 - markdown kod bloğu ile sarılmış veya `### FILE:` başlığı taşıyan içerik
 - proje kökü dışına çıkan yollar (`..`, mutlak yol, `~`, `.git/`, `.swarm/`)
 - mevcut dosyayla birebir aynı içerik (no-op)
@@ -305,10 +315,21 @@ kapsam dışı refactor, vizyondan sapma, kabul kriterlerinin karşılanmaması.
 Yazma güvenliği:
 
 - Onaydan önce eski dosya `.swarm/backups/<YYYYMMDD-HHMMSS-mmm>/<göreli yol>` altına kopyalanır.
-- Dosya, `tokio::fs::write` ile tam içerik olarak yazılır (diff değil).
+- Dosya geçici bir kardeş dosyaya yazılıp `rename` ile yerine konur (yarım dosya görünmez,
+  izinler korunur). Tam içerik yazılır, diff değil.
+- Mevcut dosya `Dosya bağlamı` sınırından büyükse İşçi'ye kırpılmış hali gösterilip
+  üstüne yazılmaz; görev atlanır ve sebebi Komutan'a bildirilir.
+- Komutan'ın seçtiği `contextFiles` (en fazla 3, dosya başına 6000 karakter) İşçi'ye salt-okunur
+  bağlam olarak verilir.
+- IDE HTTP köprüsüne yalnızca o alana yazdığın anahtar gönderilir; `OPENROUTER_API_KEY` gibi
+  ortam değişkenleri asla köprüye sızmaz.
 - `Dry-run` açıksa hiçbir şey yazılmaz; sadece raporlanır.
 - `cargo check` doğrulaması açıksa hata durumunda dosya yedeğe geri alınır ve revizyon istenir.
-- "Durdur" iptal bayrağıdır: devam eden model çağrısı biter, sonra döngü durur; yarım dosya kalmaz.
+  Proje başlamadan önce zaten derlenmiyorsa doğrulama o çalıştırma için otomatik kapatılır.
+- `Dry-run` veya otomatik uygulama kapalıyken tek tur çalışır (proje değişmediği için)
+- "Durdur" devam eden model çağrısını (HTTP isteği / CLI süreci) hemen iptal eder; dosyalar yalnızca
+  çağrılar arasında yazıldığı için yarım dosya kalmaz. Doğrulama sırasında durdurulursa doğrulanmamış
+  yazım geri alınır.
 
 Ayrıca `.gitignore` içinde `.swarm/` ve `.env` hazırdır.
 
@@ -322,6 +343,7 @@ Ayrıca `.gitignore` içinde `.swarm/` ve `.env` hazırdır.
 | `start_command_center` | `{ config: AgentConfig }` | proje kök yolu |
 | `stop_command_center` | — | `void` |
 | `get_status` | — | `{ running, stats, logs }` |
+| `get_stats` | — | `{ running, stats }` (log geçmişi olmadan, sık sorgu için) |
 | `check_provider` | `{ config: ProviderConfig, projectPath?: string }` | test yanıtı |
 | `list_models` | `{ config: ProviderConfig, projectPath?: string }` | `{ models: [{ id, name, context? }], source, note }` |
 
@@ -351,6 +373,8 @@ Canlı olaylar: `agent-log` (her adım) ve `agent-status` (`{ running }`).
 ## 9. Bilinçli sınırlar
 
 - Model çağrıları **streaming değil**; tek yanıt alınır (log akışı ayrıdır).
+- `claude -p` / `opencode run` kendi araçlarıyla proje dizininde çalışır; bu CLI'ların kendi izin
+  ayarları geçerlidir. Uygulamanın güvenlik katmanları yalnızca kendi yazımlarını kapsar.
 - Ajan keyfi shell komutu çalıştırmaz; tek istisna opsiyonel `cargo check`.
 - Yazma tam dosya bazlıdır; satır bazlı diff uygulanmaz.
 - API anahtarları diske yazılmaz; kalıcı kullanım için ortam değişkeni önerilir.

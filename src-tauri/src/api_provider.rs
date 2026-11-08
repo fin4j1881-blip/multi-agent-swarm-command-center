@@ -2,9 +2,13 @@
 
 use crate::config::{ApiKind, ProviderConfig};
 use crate::provider::ModelProvider;
+use crate::util::snippet;
 use async_trait::async_trait;
+use reqwest::RequestBuilder;
 use serde_json::{json, Value};
 use std::time::Duration;
+
+const MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Clone)]
 pub struct ApiProvider {
@@ -28,9 +32,9 @@ impl ApiProvider {
         let base_url = cfg
             .base_url
             .as_deref()
-            .map(|s| s.trim())
+            .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+            .map(str::to_string)
             .unwrap_or_else(|| cfg.api_kind.default_base_url().to_string());
 
         if base_url.is_empty() {
@@ -51,7 +55,7 @@ impl ApiProvider {
             .build()
             .map_err(|e| format!("HTTP istemcisi oluşturulamadı: {e}"))?;
 
-        let label = format!("API · {} · {}", cfg.api_kind.as_str(), model);
+        let label = Self::make_label(cfg.api_kind, &model);
 
         Ok(Self {
             client,
@@ -65,19 +69,17 @@ impl ApiProvider {
         })
     }
 
+    fn make_label(kind: ApiKind, model: &str) -> String {
+        format!("API · {} · {}", kind.as_str(), model)
+    }
+
     /// Clones this provider with an alternate model name for fallback execution.
     pub fn with_model(&self, new_model: &str) -> Self {
         let model = new_model.trim().to_string();
-        let label = format!("API · {} · {}", self.kind.as_str(), model);
         Self {
-            client: self.client.clone(),
-            kind: self.kind,
+            label: Self::make_label(self.kind, &model),
             model,
-            api_key: self.api_key.clone(),
-            base_url: self.base_url.clone(),
-            temperature: self.temperature,
-            max_tokens: self.max_tokens,
-            label,
+            ..self.clone()
         }
     }
 
@@ -105,60 +107,98 @@ impl ApiProvider {
         }
     }
 
+    /// OpenAI's reasoning models (o-series, gpt-5) reject `temperature`.
+    fn omits_temperature(&self) -> bool {
+        if self.kind != ApiKind::Openai {
+            return false;
+        }
+        let model = self.model.to_lowercase();
+        model.starts_with("gpt-5")
+            || model
+                .strip_prefix('o')
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    }
+
+    /// Sends the request, retrying 429 / 5xx / network failures with backoff,
+    /// and returns the body of the first successful response.
+    async fn post_with_retry(
+        &self,
+        label: &str,
+        build: impl Fn() -> RequestBuilder,
+    ) -> Result<String, String> {
+        let mut last_error = String::from("bilinmeyen hata");
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let retries_left = attempt + 1 < MAX_ATTEMPTS;
+
+            match build().send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after = resp
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.trim().parse::<u64>().ok());
+                    let text = resp.text().await.unwrap_or_default();
+
+                    if status.is_success() {
+                        return Ok(text);
+                    }
+                    last_error = format!("HTTP {}: {}", status.as_u16(), snippet(&text, 700));
+                    let transient = status.as_u16() == 429 || status.is_server_error();
+                    if !(transient && retries_left) {
+                        return Err(format!("{label} isteği başarısız → {last_error}"));
+                    }
+                    sleep_backoff(attempt, retry_after).await;
+                }
+                Err(e) => {
+                    last_error = format!("ağ hatası: {e}");
+                    if !retries_left {
+                        break;
+                    }
+                    sleep_backoff(attempt, None).await;
+                }
+            }
+        }
+        Err(format!("{label} çağrısı başarısız → {last_error}"))
+    }
+
     async fn openai_compatible(&self, prompt: &str, system_prompt: &str) -> Result<String, String> {
         let url = self.chat_endpoint();
-        let body = json!({
+        let mut body = json!({
             "model": self.model,
             "messages": [
                 { "role": "system", "content": system_prompt },
                 { "role": "user", "content": prompt }
             ],
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens
         });
-
-        let mut last_error = String::from("bilinmeyen hata");
-        for attempt in 0..3u32 {
-            let mut req = self.client.post(&url).json(&body);
-            if !self.api_key.is_empty() {
-                req = req.bearer_auth(&self.api_key);
-            }
-            if self.kind == ApiKind::Openrouter {
-                req = req
-                    .header("HTTP-Referer", "https://localhost/swarm-command-center")
-                    .header("X-Title", "Swarm Command Center");
-            }
-
-            match req.send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    if status.is_success() {
-                        return parse_openai_body(&text);
-                    }
-                    last_error = format!("HTTP {}: {}", status.as_u16(), snippet(&text, 700));
-                    if (status.as_u16() == 429 || status.is_server_error()) && attempt < 2 {
-                        sleep_backoff(attempt).await;
-                        continue;
-                    }
-                    return Err(format!(
-                        "{} isteği başarısız → {last_error}",
-                        self.kind.as_str()
-                    ));
-                }
-                Err(e) => {
-                    last_error = format!("ağ hatası: {e}");
-                    if attempt < 2 {
-                        sleep_backoff(attempt).await;
-                        continue;
-                    }
-                }
-            }
+        if !self.omits_temperature() {
+            body["temperature"] = json!(self.temperature);
         }
-        Err(format!(
-            "{} çağrısı başarısız → {last_error}",
-            self.kind.as_str()
-        ))
+        // OpenAI deprecated `max_tokens`; every other OpenAI-compatible server
+        // (Ollama, DeepSeek, OpenRouter...) still expects it.
+        let token_field = if self.kind == ApiKind::Openai {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        body[token_field] = json!(self.max_tokens);
+
+        let text = self
+            .post_with_retry(self.kind.as_str(), || {
+                let mut req = self.client.post(&url).json(&body);
+                if !self.api_key.is_empty() {
+                    req = req.bearer_auth(&self.api_key);
+                }
+                if self.kind == ApiKind::Openrouter {
+                    req = req
+                        .header("HTTP-Referer", "https://localhost/swarm-command-center")
+                        .header("X-Title", "Swarm Command Center");
+                }
+                req
+            })
+            .await?;
+        parse_openai_body(&text)
     }
 
     async fn anthropic(&self, prompt: &str, system_prompt: &str) -> Result<String, String> {
@@ -173,41 +213,20 @@ impl ApiProvider {
             ]
         });
 
-        let mut last_error = String::from("bilinmeyen hata");
-        for attempt in 0..3u32 {
-            let mut req = self
-                .client
-                .post(&url)
-                .header("anthropic-version", "2023-06-01")
-                .json(&body);
-            if !self.api_key.is_empty() {
-                req = req.header("x-api-key", &self.api_key);
-            }
-
-            match req.send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    if status.is_success() {
-                        return parse_anthropic_body(&text);
-                    }
-                    last_error = format!("HTTP {}: {}", status.as_u16(), snippet(&text, 700));
-                    if (status.as_u16() == 429 || status.is_server_error()) && attempt < 2 {
-                        sleep_backoff(attempt).await;
-                        continue;
-                    }
-                    return Err(format!("Anthropic isteği başarısız → {last_error}"));
+        let text = self
+            .post_with_retry("Anthropic", || {
+                let mut req = self
+                    .client
+                    .post(&url)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&body);
+                if !self.api_key.is_empty() {
+                    req = req.header("x-api-key", &self.api_key);
                 }
-                Err(e) => {
-                    last_error = format!("ağ hatası: {e}");
-                    if attempt < 2 {
-                        sleep_backoff(attempt).await;
-                        continue;
-                    }
-                }
-            }
-        }
-        Err(format!("Anthropic çağrısı başarısız → {last_error}"))
+                req
+            })
+            .await?;
+        parse_anthropic_body(&text)
     }
 }
 
@@ -225,19 +244,16 @@ impl ModelProvider for ApiProvider {
     }
 }
 
-async fn sleep_backoff(attempt: u32) {
-    let secs = 1u64 << attempt.min(3);
+/// Exponential backoff (1s, 2s, 4s...), or the server's `Retry-After` (capped).
+async fn sleep_backoff(attempt: u32, retry_after: Option<u64>) {
+    let secs = retry_after
+        .map(|s| s.clamp(1, 30))
+        .unwrap_or(1u64 << attempt.min(3));
     tokio::time::sleep(Duration::from_secs(secs)).await;
 }
 
-fn snippet(text: &str, max: usize) -> String {
-    let clean = text.trim();
-    if clean.chars().count() <= max {
-        return clean.to_string();
-    }
-    let cut: String = clean.chars().take(max).collect();
-    format!("{cut}…")
-}
+const TRUNCATED: &str = "Yanıt çıktı token sınırında (max_tokens) kesildi; dosya eksik gelirdi. \
+     Gelişmiş ayarlardan çıktı token sınırını artır veya görevi daha küçük bir dosyaya böl.";
 
 fn parse_openai_body(text: &str) -> Result<String, String> {
     let value: Value = serde_json::from_str(text)
@@ -247,9 +263,14 @@ fn parse_openai_body(text: &str) -> Result<String, String> {
         let message = err
             .get("message")
             .and_then(Value::as_str)
-            .map(|m| m.to_string())
+            .map(str::to_string)
             .unwrap_or_else(|| err.to_string());
         return Err(format!("API hatası: {message}"));
+    }
+
+    // A cut-off answer would be written to disk as a broken file.
+    if value["choices"][0]["finish_reason"].as_str() == Some("length") {
+        return Err(TRUNCATED.to_string());
     }
 
     let message = &value["choices"][0]["message"];
@@ -287,9 +308,13 @@ fn parse_anthropic_body(text: &str) -> Result<String, String> {
         let message = err
             .get("message")
             .and_then(Value::as_str)
-            .map(|m| m.to_string())
+            .map(str::to_string)
             .unwrap_or_else(|| err.to_string());
         return Err(format!("Anthropic hatası: {message}"));
+    }
+
+    if value["stop_reason"].as_str() == Some("max_tokens") {
+        return Err(TRUNCATED.to_string());
     }
 
     if let Some(parts) = value["content"].as_array() {
@@ -395,5 +420,36 @@ mod tests {
             ),
             "http://127.0.0.1:11434/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn truncated_answers_are_errors() {
+        let openai = r#"{"choices":[{"finish_reason":"length","message":{"content":"yarım"}}]}"#;
+        assert!(parse_openai_body(openai)
+            .unwrap_err()
+            .contains("max_tokens"));
+        let claude = r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"yarım"}]}"#;
+        assert!(parse_anthropic_body(claude)
+            .unwrap_err()
+            .contains("max_tokens"));
+        let fine = r#"{"choices":[{"finish_reason":"stop","message":{"content":"tam"}}]}"#;
+        assert_eq!(parse_openai_body(fine).unwrap(), "tam");
+    }
+
+    #[test]
+    fn reasoning_models_skip_temperature() {
+        let provider = |model: &str| {
+            let cfg = ProviderConfig {
+                api_kind: ApiKind::Openai,
+                model: model.into(),
+                api_key: Some("k".into()),
+                ..Default::default()
+            };
+            ApiProvider::new(&cfg).unwrap()
+        };
+        assert!(provider("o4-mini").omits_temperature());
+        assert!(provider("gpt-5").omits_temperature());
+        assert!(!provider("gpt-4.1-mini").omits_temperature());
+        assert!(!provider("omni-moderation").omits_temperature());
     }
 }

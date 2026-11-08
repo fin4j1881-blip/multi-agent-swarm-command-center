@@ -10,10 +10,13 @@ mod prompts;
 mod protocol;
 mod provider;
 mod state;
+mod util;
 mod workspace;
 
 use config::{AgentConfig, ProviderConfig};
-use state::{emit_log, emit_status, now_iso, AppState, LogEvent, SharedState, StatusPayload};
+use state::{
+    emit_log, emit_status, now_iso, AppState, LogEvent, SharedState, StatsPayload, StatusPayload,
+};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
@@ -66,10 +69,8 @@ async fn start_command_center(
 
     let shared: SharedState = state.inner().clone();
     let handle = app.clone();
-    let cfg = config.clone();
-
     tauri::async_runtime::spawn(async move {
-        orchestrator::run(handle, shared, cfg).await;
+        orchestrator::run(handle, shared, config).await;
     });
 
     Ok(root.to_string_lossy().to_string())
@@ -105,8 +106,27 @@ async fn get_status(state: State<'_, SharedState>) -> Result<StatusPayload, Stri
     Ok(StatusPayload {
         running: guard.running,
         stats: guard.stats.clone(),
-        logs: guard.logs.clone(),
+        logs: guard.logs.iter().cloned().collect(),
     })
+}
+
+/// Lightweight variant of `get_status` for frequent polling: no log history.
+#[tauri::command]
+async fn get_stats(state: State<'_, SharedState>) -> Result<StatsPayload, String> {
+    let guard = state.lock().await;
+    Ok(StatsPayload {
+        running: guard.running,
+        stats: guard.stats.clone(),
+    })
+}
+
+/// Directory model/CLI probes run in: the project if given, else the cwd.
+fn probe_dir(project_path: Option<String>) -> std::path::PathBuf {
+    project_path
+        .filter(|p| !p.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
 /// One-shot connectivity probe for either provider type (UI "Test" button).
@@ -117,15 +137,7 @@ async fn check_provider(
 ) -> Result<String, String> {
     config.validate("Sağlayıcı")?;
 
-    let dir = project_path
-        .filter(|p| !p.trim().is_empty())
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| ".".to_string())
-        });
-
-    let provider = provider::build(&config, std::path::Path::new(&dir))?;
+    let provider = provider::build(&config, &probe_dir(project_path), "Test")?;
     let answer = provider
         .complete(
             "Bağlantı testi. Sadece OK yaz.",
@@ -144,15 +156,7 @@ async fn list_models(
     config: ProviderConfig,
     project_path: Option<String>,
 ) -> Result<models::ModelCatalog, String> {
-    let dir = project_path
-        .filter(|p| !p.trim().is_empty())
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| ".".to_string())
-        });
-
-    models::list_models(&config, std::path::Path::new(&dir)).await
+    models::list_models(&config, &probe_dir(project_path)).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -167,6 +171,7 @@ pub fn run() {
             start_command_center,
             stop_command_center,
             get_status,
+            get_stats,
             check_provider,
             list_models
         ])

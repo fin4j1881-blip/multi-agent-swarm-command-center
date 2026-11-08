@@ -14,6 +14,7 @@
 
 use crate::config::{IdeKind, ProviderConfig};
 use crate::provider::ModelProvider;
+use crate::util::snippet;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -31,8 +32,15 @@ enum Transport {
         program: String,
         args: Vec<String>,
         prompt_via_stdin: bool,
+        /// Built-in CLIs take `--model <id>`; a user-defined CLI has its own
+        /// conventions and its arguments must never be rewritten.
+        inject_model: bool,
     },
 }
+
+/// Largest single argv entry we pass. Linux caps one argument at 128 KiB
+/// (MAX_ARG_STRLEN) and Windows caps the whole command line at ~32 K chars.
+const MAX_ARGV_BYTES: usize = if cfg!(windows) { 30_000 } else { 120_000 };
 
 /// Resolves the binary for a built-in CLI bridge.
 ///
@@ -87,27 +95,25 @@ pub fn resolve_program(kind: IdeKind) -> String {
         _ => &[],
     };
 
-    let home = std::env::var("HOME").unwrap_or_default();
+    // 1. Whatever the user's PATH resolves (the most specific, least surprising).
+    if let Some(found) = find_in_path(program) {
+        return found;
+    }
 
-    // Check special directories like Claude Code's nested install: ~/.config/Claude/claude-code/*/*/claude
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+
+    // 2. Claude desktop bundles its own CLI: ~/.config/Claude/claude-code/<ver>/<hash>/claude.
     if kind == IdeKind::ClaudeCode && !home.is_empty() {
-        let claude_base = Path::new(&home).join(".config/Claude/claude-code");
-        if claude_base.is_dir() {
-            if let Ok(versions) = std::fs::read_dir(&claude_base) {
-                for v in versions.flatten() {
-                    if let Ok(hashes) = std::fs::read_dir(v.path()) {
-                        for h in hashes.flatten() {
-                            let bin = h.path().join("claude");
-                            if bin.is_file() {
-                                return bin.to_string_lossy().to_string();
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(bin) =
+            newest_bundled_claude(&Path::new(&home).join(".config/Claude/claude-code"))
+        {
+            return bin;
         }
     }
 
+    // 3. Well-known install locations.
     for candidate in candidates {
         let path = match candidate.strip_prefix("~/") {
             Some(rest) if !home.is_empty() => format!("{home}/{rest}"),
@@ -119,6 +125,46 @@ pub fn resolve_program(kind: IdeKind) -> String {
     }
 
     program.to_string()
+}
+
+/// Looks `program` up in `PATH` without spawning anything.
+fn find_in_path(program: &str) -> Option<String> {
+    let paths = std::env::var_os("PATH")?;
+    let suffixes: &[&str] = if cfg!(windows) {
+        &[".exe", ".cmd", ".bat", ""]
+    } else {
+        &[""]
+    };
+    std::env::split_paths(&paths)
+        .flat_map(|dir| {
+            suffixes
+                .iter()
+                .map(move |ext| dir.join(format!("{program}{ext}")))
+        })
+        .find(|candidate| candidate.is_file())
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Picks the `claude` binary of the highest bundled version directory.
+fn newest_bundled_claude(base: &Path) -> Option<String> {
+    let version_key = |name: &str| -> Vec<u64> {
+        name.split(|c: char| !c.is_ascii_digit())
+            .filter_map(|part| part.parse().ok())
+            .collect()
+    };
+
+    let mut versions: Vec<_> = std::fs::read_dir(base).ok()?.flatten().collect();
+    versions
+        .sort_by_key(|entry| std::cmp::Reverse(version_key(&entry.file_name().to_string_lossy())));
+
+    versions.iter().find_map(|version| {
+        std::fs::read_dir(version.path())
+            .ok()?
+            .flatten()
+            .map(|hash| hash.path().join("claude"))
+            .find(|bin| bin.is_file())
+            .map(|bin| bin.to_string_lossy().to_string())
+    })
 }
 
 pub struct IdeBridgeProvider {
@@ -148,7 +194,8 @@ impl IdeBridgeProvider {
             }
             Transport::Http {
                 endpoint: endpoint.trim_end_matches('/').to_string(),
-                bearer: cfg.resolve_api_key(),
+                // Only a key typed for this bridge; never an env key meant for a cloud API.
+                bearer: cfg.explicit_api_key(),
             }
         } else {
             match cfg.ide_kind {
@@ -174,6 +221,7 @@ impl IdeBridgeProvider {
                         program,
                         args,
                         prompt_via_stdin: false,
+                        inject_model: false,
                     }
                 }
                 kind => {
@@ -190,6 +238,7 @@ impl IdeBridgeProvider {
                         program: resolve_program(kind),
                         args,
                         prompt_via_stdin: kind.prompt_via_stdin(),
+                        inject_model: true,
                     }
                 }
             }
@@ -260,26 +309,26 @@ impl IdeBridgeProvider {
                 program,
                 args,
                 prompt_via_stdin,
+                inject_model,
             } => {
-                let mut updated_args = Vec::new();
-                let mut skip_next = false;
-                for arg in args {
-                    if skip_next {
-                        skip_next = false;
-                        continue;
+                let mut updated_args = Vec::with_capacity(args.len() + 2);
+                if *inject_model {
+                    let mut skip_next = false;
+                    for arg in args {
+                        if skip_next {
+                            skip_next = false;
+                        } else if arg == "--model" {
+                            skip_next = true;
+                        } else if !arg.starts_with("--model=") {
+                            updated_args.push(arg.clone());
+                        }
                     }
-                    if arg == "--model" {
-                        skip_next = true;
-                        continue;
+                    if !new_model.is_empty() {
+                        updated_args.push("--model".into());
+                        updated_args.push(new_model.clone());
                     }
-                    if arg.starts_with("--model=") {
-                        continue;
-                    }
-                    updated_args.push(arg.clone());
-                }
-                if !new_model.is_empty() {
-                    updated_args.push("--model".into());
-                    updated_args.push(new_model.clone());
+                } else {
+                    updated_args.clone_from(args);
                 }
                 let lbl = format!(
                     "IDE · CLI · {}{}",
@@ -295,6 +344,7 @@ impl IdeBridgeProvider {
                         program: program.clone(),
                         args: updated_args,
                         prompt_via_stdin: *prompt_via_stdin,
+                        inject_model: *inject_model,
                     },
                     lbl,
                 )
@@ -314,7 +364,7 @@ impl IdeBridgeProvider {
     async fn via_http(
         &self,
         endpoint: &str,
-        bearer: &Option<String>,
+        bearer: Option<&str>,
         prompt: &str,
         system_prompt: &str,
     ) -> Result<String, String> {
@@ -340,22 +390,18 @@ impl IdeBridgeProvider {
             return Err(format!(
                 "IDE köprüsü HTTP {} döndürdü: {}",
                 status.as_u16(),
-                truncate(&text, 600)
+                snippet(&text, 600)
             ));
         }
 
-        let value: Value = serde_json::from_str(&text).map_err(|e| {
-            format!(
-                "IDE köprüsü JSON döndürmedi ({e}): {}",
-                truncate(&text, 400)
-            )
-        })?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|e| format!("IDE köprüsü JSON döndürmedi ({e}): {}", snippet(&text, 400)))?;
 
         extract_text(&value).ok_or_else(|| {
             format!(
                 "IDE köprüsü yanıtında metin bulunamadı. Beklenen alanlardan biri: content, text, \
                  output, response, message.content, choices[0].message.content, parts[].text. Gelen: {}",
-                truncate(&text, 400)
+                snippet(&text, 400)
             )
         })
     }
@@ -388,6 +434,15 @@ impl IdeBridgeProvider {
             final_args.push(full_prompt.clone());
         }
 
+        if let Some(too_big) = final_args.iter().find(|a| a.len() > MAX_ARGV_BYTES) {
+            return Err(format!(
+                "Prompt ({} KB) komut satırı sınırını aşıyor. Bu CLI promptu argüman olarak \
+                 aldığı için dosya bağlamı küçültülmeli (Gelişmiş → Dosya bağlamı) ya da \
+                 prompt'u stdin'den okuyan Claude Code / HTTP köprüsü kullanılmalı.",
+                too_big.len() / 1024
+            ));
+        }
+
         let mut cmd = Command::new(program);
         cmd.args(&final_args)
             .current_dir(&self.cwd)
@@ -407,14 +462,16 @@ impl IdeBridgeProvider {
             )
         })?;
 
+        // Feed stdin from a task: a child that never reads it must not block
+        // us past the timeout. A broken pipe just means the child exited early,
+        // and its own error output is more useful than ours.
         if via_stdin {
             if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(full_prompt.as_bytes())
-                    .await
-                    .map_err(|e| format!("Prompt stdin'e yazılamadı: {e}"))?;
-                let _ = stdin.flush().await;
-                drop(stdin);
+                let payload = full_prompt.clone();
+                tokio::spawn(async move {
+                    let _ = stdin.write_all(payload.as_bytes()).await;
+                    let _ = stdin.shutdown().await;
+                });
             }
         }
 
@@ -433,9 +490,9 @@ impl IdeBridgeProvider {
 
         if !output.status.success() {
             let detail = if stderr.trim().is_empty() {
-                truncate(&stdout, 900)
+                snippet(&stdout, 900)
             } else {
-                truncate(&stderr, 900)
+                snippet(&stderr, 900)
             };
             return Err(format!(
                 "'{program}' hata kodu {:?} ile çıktı: {detail}",
@@ -448,7 +505,7 @@ impl IdeBridgeProvider {
             if !stderr.trim().is_empty() {
                 return Err(format!(
                     "'{program}' boş yanıt döndürdü. stderr: {}",
-                    truncate(&stderr, 900)
+                    snippet(&stderr, 900)
                 ));
             }
             return Err(format!("'{program}' boş yanıt döndürdü."));
@@ -467,12 +524,14 @@ impl ModelProvider for IdeBridgeProvider {
     async fn complete(&self, prompt: &str, system_prompt: &str) -> Result<String, String> {
         match &self.transport {
             Transport::Http { endpoint, bearer } => {
-                self.via_http(endpoint, bearer, prompt, system_prompt).await
+                self.via_http(endpoint, bearer.as_deref(), prompt, system_prompt)
+                    .await
             }
             Transport::Cli {
                 program,
                 args,
                 prompt_via_stdin,
+                ..
             } => {
                 self.via_cli(program, args, *prompt_via_stdin, prompt, system_prompt)
                     .await
@@ -538,15 +597,6 @@ fn strip_ansi(input: &str) -> String {
         out.push(c);
     }
     out
-}
-
-fn truncate(text: &str, max: usize) -> String {
-    let trimmed = text.trim();
-    if trimmed.chars().count() <= max {
-        return trimmed.to_string();
-    }
-    let cut: String = trimmed.chars().take(max).collect();
-    format!("{cut}…")
 }
 
 #[cfg(test)]
@@ -616,5 +666,61 @@ mod tests {
         let bin = resolve_program(IdeKind::ClaudeCode);
         println!("Resolved Claude: {}", bin);
         assert!(!bin.is_empty());
+    }
+
+    #[test]
+    fn custom_cli_arguments_are_never_rewritten_for_fallback_models() {
+        let cfg = ProviderConfig {
+            source: ProviderSource::Ide,
+            ide_kind: IdeKind::CustomCli,
+            ide_command: Some("aider".into()),
+            ide_args: vec!["--model".into(), "mine".into(), "{prompt}".into()],
+            ..Default::default()
+        };
+        let base = IdeBridgeProvider::new(&cfg, std::path::Path::new(".")).unwrap();
+        let alt = base.with_model("other");
+        match alt.transport {
+            Transport::Cli { ref args, .. } => {
+                assert_eq!(args, &["--model", "mine", "{prompt}"]);
+            }
+            _ => panic!("expected CLI transport"),
+        }
+    }
+
+    #[test]
+    fn builtin_cli_swaps_the_model_flag() {
+        let cfg = ProviderConfig {
+            source: ProviderSource::Ide,
+            ide_kind: IdeKind::Opencode,
+            model: "a/one".into(),
+            ..Default::default()
+        };
+        let alt = IdeBridgeProvider::new(&cfg, std::path::Path::new("."))
+            .unwrap()
+            .with_model("b/two");
+        match alt.transport {
+            Transport::Cli { ref args, .. } => {
+                assert_eq!(args.iter().filter(|a| *a == "--model").count(), 1);
+                assert_eq!(args.last().map(String::as_str), Some("b/two"));
+            }
+            _ => panic!("expected CLI transport"),
+        }
+    }
+
+    #[test]
+    fn bridge_never_receives_env_api_keys() {
+        std::env::set_var("OPENROUTER_API_KEY", "sk-should-not-leak");
+        let cfg = ProviderConfig {
+            source: ProviderSource::Ide,
+            ide_kind: IdeKind::CustomHttp,
+            ide_endpoint: Some("http://127.0.0.1:9".into()),
+            ..Default::default()
+        };
+        let provider = IdeBridgeProvider::new(&cfg, std::path::Path::new(".")).unwrap();
+        match provider.transport {
+            Transport::Http { bearer, .. } => assert!(bearer.is_none()),
+            _ => panic!("expected HTTP transport"),
+        }
+        std::env::remove_var("OPENROUTER_API_KEY");
     }
 }

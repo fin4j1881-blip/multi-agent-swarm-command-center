@@ -23,6 +23,7 @@ ZORUNLU KURALLAR
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn plan_prompt(
     vision: &str,
     instructions: &str,
@@ -31,6 +32,7 @@ pub fn plan_prompt(
     failures: &[String],
     round: u32,
     max_rounds: u32,
+    max_tasks: u32,
 ) -> String {
     let completed_block = if completed.is_empty() {
         "(henüz yok)".to_string()
@@ -80,7 +82,7 @@ TAMAMLANAN GÖREVLER
 
 DURUM
 ================
-Tur {round}/{max_rounds}. Şimdi sıradaki en değerli 1-3 görevi planla.
+Tur {round}/{max_rounds}. Şimdi sıradaki en değerli en fazla {max_tasks} görevi planla.
 Daha önce tamamlanan işi tekrar isteme. Başarısız görevleri aynen tekrarlama; ya daha küçük ve net bir adıma böl ya da farklı bir dosyaya odaklan.
 Sadece JSON döndür."#
     )
@@ -105,11 +107,13 @@ ZORUNLU KURALLAR
         .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn coder_prompt(
     vision: &str,
     instructions: &str,
     task: &PlanTask,
     current: Option<&str>,
+    context_files: &str,
     feedback: &str,
     attempt: u32,
     max_attempts: u32,
@@ -128,6 +132,11 @@ pub fn coder_prompt(
         "(yok)".to_string()
     } else {
         task.context_files.join(", ")
+    };
+    let context_block = if context_files.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", context_files.trim_end())
     };
 
     let current_block = match current {
@@ -178,6 +187,7 @@ KABUL KRİTERLERİ
 DENEME: {attempt}/{max_attempts}
 
 {current_block}
+{context_block}
 
 Şimdi `{file}` dosyasının TAM yeni içeriğini, istenen formatta üret."#,
         id = task.id,
@@ -195,6 +205,7 @@ DENEME: {attempt}/{max_attempts}
         attempt = attempt,
         max_attempts = max_attempts,
         current_block = current_block,
+        context_block = context_block,
     )
 }
 

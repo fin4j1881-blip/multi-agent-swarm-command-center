@@ -1,7 +1,8 @@
 //! Shared, thread-safe runtime state plus the log/event plumbing.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
@@ -54,16 +55,20 @@ pub struct RunStats {
     pub tasks_total: u32,
     pub tasks_applied: u32,
     pub tasks_rejected: u32,
+    pub tasks_skipped: u32,
     pub files_written: u32,
     pub revisions: u32,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
 }
 
+/// Ring-buffer size of the log replayed to a UI that (re)connects.
+const MAX_LOGS: usize = 800;
+
 pub struct AppState {
     pub running: bool,
     pub stop: Arc<AtomicBool>,
-    pub logs: Vec<LogEvent>,
+    pub logs: VecDeque<LogEvent>,
     pub stats: RunStats,
 }
 
@@ -72,23 +77,18 @@ impl Default for AppState {
         Self {
             running: false,
             stop: Arc::new(AtomicBool::new(false)),
-            logs: Vec::new(),
+            logs: VecDeque::new(),
             stats: RunStats::default(),
         }
     }
 }
 
 impl AppState {
-    pub fn should_stop(&self) -> bool {
-        self.stop.load(Ordering::SeqCst)
-    }
-
     pub fn push_log(&mut self, event: LogEvent) {
-        self.logs.push(event);
-        if self.logs.len() > 800 {
-            let overflow = self.logs.len() - 800;
-            self.logs.drain(0..overflow);
+        if self.logs.len() >= MAX_LOGS {
+            self.logs.pop_front();
         }
+        self.logs.push_back(event);
     }
 }
 
@@ -100,6 +100,14 @@ pub struct StatusPayload {
     pub running: bool,
     pub stats: RunStats,
     pub logs: Vec<LogEvent>,
+}
+
+/// Cheap status snapshot for the UI's frequent polling (no log history).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsPayload {
+    pub running: bool,
+    pub stats: RunStats,
 }
 
 /// Appends to the in-memory ring buffer and streams the event to the UI.

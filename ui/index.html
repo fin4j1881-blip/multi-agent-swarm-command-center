@@ -288,6 +288,10 @@
               <span>Dosya bağlamı (karakter)</span>
               <input id="contextChars" type="number" min="2000" max="200000" step="1000" value="24000" />
             </label>
+            <label class="field">
+              <span>Maks. çıktı token <em class="optional">işçi tam dosya yazar</em></span>
+              <input id="maxTokens" type="number" min="1024" max="64000" step="1024" value="8192" />
+            </label>
           </div>
           <div class="checks">
             <label class="check"><input id="autoApply" type="checkbox" checked /> Onaylanan kodu otomatik yaz</label>
@@ -304,6 +308,7 @@
             <span class="chip"><b id="statRound">0</b> tur</span>
             <span class="chip"><b id="statApplied">0</b> uygulandı</span>
             <span class="chip"><b id="statRejected">0</b> red</span>
+            <span class="chip"><b id="statSkipped">0</b> yazılmadı</span>
             <span class="chip"><b id="statRevisions">0</b> revizyon</span>
             <span class="chip"><b id="statFiles">0</b> dosya</span>
           </div>
@@ -324,7 +329,7 @@
 
         <div class="console-foot">
           <span id="footStatus" class="muted">Bekliyor</span>
-          <span class="muted">Yalnızca onaylanan dosyalar yazılır · maks. 3 revizyon</span>
+          <span id="footHint" class="muted">Yalnızca onaylanan dosyalar yazılır</span>
         </div>
       </section>
     </main>

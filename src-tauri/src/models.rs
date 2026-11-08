@@ -5,6 +5,7 @@
 //! Endpoint URLs are derived from the selected provider kind.
 
 use crate::config::{ApiKind, IdeKind, ProviderConfig, ProviderSource};
+use crate::util::snippet;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -166,8 +167,10 @@ async fn ide_catalog(cfg: &ProviderConfig, project_dir: &Path) -> Result<ModelCa
             };
 
             let models = [
+                ("claude-fable-5-1", "Claude Fable 5.1"),
                 ("claude-opus-5-5", "Claude Opus 5.5"),
                 ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+                ("claude-haiku-5-5", "Claude Haiku 5.5"),
                 ("claude-opus-4-6", "Claude Opus 4.6"),
                 ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
                 ("claude-3-7-sonnet", "Claude 3.7 Sonnet"),
@@ -323,7 +326,8 @@ async fn http_models(endpoint: &str, cfg: &ProviderConfig) -> Result<Vec<ModelIn
         .map_err(|e| format!("HTTP istemcisi oluşturulamadı: {e}"))?;
 
     let mut req = client.get(&url);
-    if let Some(token) = cfg.resolve_api_key() {
+    // Only a key typed for this bridge; never an env key meant for a cloud API.
+    if let Some(token) = cfg.explicit_api_key() {
         req = req.bearer_auth(token);
     }
 
@@ -411,15 +415,6 @@ fn empty_catalog(source: &str, note: impl Into<String>) -> ModelCatalog {
         source: source.to_string(),
         note: note.into(),
     }
-}
-
-fn snippet(text: &str, max: usize) -> String {
-    let trimmed = text.trim();
-    if trimmed.chars().count() <= max {
-        return trimmed.to_string();
-    }
-    let cut: String = trimmed.chars().take(max).collect();
-    format!("{cut}…")
 }
 
 #[cfg(test)]

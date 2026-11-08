@@ -6,20 +6,19 @@
 
 use crate::protocol::{PlanTask, Proposal};
 use crate::workspace::normalize_rel;
-use std::path::Path;
 
 pub struct Precheck {
     pub issues: Vec<String>,
     pub warnings: Vec<String>,
 }
 
+/// Phrases that only appear when a model abbreviated the file. A marker the
+/// current file already contains is not held against the new version.
 const PLACEHOLDER_MARKERS: &[&str] = &[
     "... existing code",
     "...existing code",
     "... rest of",
     "...rest of",
-    "// ...",
-    "/* ... */",
     "your code here",
     "kalan kod",
     "kodun geri kalanı",
@@ -29,8 +28,24 @@ const PLACEHOLDER_MARKERS: &[&str] = &[
     "buraya kod",
     "aynı kalır",
     "değişmeden kalır",
-    "unchanged",
 ];
+
+/// A line that is *only* an elision, e.g. `// ...` or `/* ... */`.
+fn is_elision_line(line: &str) -> bool {
+    matches!(
+        line.trim(),
+        "..." | "// ..." | "# ..." | "/* ... */" | "<!-- ... -->" | "-- ..." | "…"
+    )
+}
+
+/// A short comment announcing that code was left out ("// rest unchanged").
+fn is_unchanged_comment(line: &str) -> bool {
+    let line = line.trim().to_lowercase();
+    let is_comment = ["//", "#", "/*", "*", "<!--", "--"]
+        .iter()
+        .any(|prefix| line.starts_with(prefix));
+    is_comment && line.chars().count() < 80 && line.contains("unchanged")
+}
 
 const CODE_EXTS: &[&str] = &[
     "rs", "js", "mjs", "cjs", "ts", "tsx", "jsx", "json", "css", "scss", "html", "go", "java",
@@ -43,12 +58,7 @@ const BINARY_EXTS: &[&str] = &[
     "so", "dylib", "wasm", "mp3", "mp4", "mov", "woff", "woff2", "ttf", "otf", "db", "sqlite",
 ];
 
-pub fn precheck(
-    root: &Path,
-    task: &PlanTask,
-    proposal: &Proposal,
-    current: Option<&str>,
-) -> Precheck {
+pub fn precheck(task: &PlanTask, proposal: &Proposal, current: Option<&str>) -> Precheck {
     let mut issues: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
@@ -82,12 +92,28 @@ pub fn precheck(
     }
 
     let lower = content.to_lowercase();
+    let current_lower = current.map(str::to_lowercase).unwrap_or_default();
     for marker in PLACEHOLDER_MARKERS.iter().copied() {
-        if lower.contains(marker) {
+        if lower.contains(marker) && !current_lower.contains(marker) {
             issues.push(format!(
                 "İçerikte eksik bırakma işareti var (`{marker}`). Dosya eksiksiz olmalı."
             ));
         }
+    }
+    let current_has_elision = current.is_some_and(|c| c.lines().any(is_elision_line));
+    if !current_has_elision && content.lines().any(is_elision_line) {
+        issues.push(
+            "İçerikte yalnızca `...` içeren bir satır var; kod kısaltılmış. Dosya eksiksiz olmalı."
+                .to_string(),
+        );
+    }
+    if content.lines().any(is_unchanged_comment)
+        && !current.is_some_and(|c| c.lines().any(is_unchanged_comment))
+    {
+        issues.push(
+            "İçerikte \"unchanged\" diyen bir yorum var; değişmeyen kısımlar da yazılmalı."
+                .to_string(),
+        );
     }
 
     let ext = file.rsplit('.').next().unwrap_or("").to_lowercase();
@@ -125,19 +151,13 @@ pub fn precheck(
     }
 
     if !task.file.trim().is_empty() && proposal.file.trim() != task.normalized_file() {
-        warnings.push(format!(
-            "Görev `{}` dosyasını istiyor, öneri `{}` dosyasına yazıyor.",
+        issues.push(format!(
+            "Görev yalnızca `{}` dosyasını kapsıyor, öneri `{}` dosyasına yazıyor. \
+             Sadece istenen dosyayı üret.",
             task.normalized_file(),
             proposal.file
         ));
     }
-
-    if file.starts_with('/') || file.contains("..") {
-        issues.push("Dosya yolu proje kökü dışına çıkıyor.".to_string());
-    }
-
-    // Root itself is only used for the path validation above.
-    let _ = root;
 
     Precheck { issues, warnings }
 }
@@ -145,7 +165,6 @@ pub fn precheck(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn task(file: &str) -> PlanTask {
         PlanTask {
@@ -167,9 +186,7 @@ mod tests {
 
     #[test]
     fn flags_placeholder_and_truncation() {
-        let root = PathBuf::from("/tmp");
         let result = precheck(
-            &root,
             &task("src/main.rs"),
             &proposal("src/main.rs", "fn main() {\n    // ... existing code\n}\n"),
             None,
@@ -179,10 +196,8 @@ mod tests {
 
     #[test]
     fn flags_noop_write() {
-        let root = PathBuf::from("/tmp");
         let current = "fn main() {\n    println!(\"hi\");\n}\n";
         let result = precheck(
-            &root,
             &task("src/main.rs"),
             &proposal("src/main.rs", current),
             Some(current),
@@ -192,9 +207,7 @@ mod tests {
 
     #[test]
     fn flags_wrapped_markdown() {
-        let root = PathBuf::from("/tmp");
         let result = precheck(
-            &root,
             &task("a.js"),
             &proposal("a.js", "```js\nconsole.log(1);\n```"),
             None,
@@ -204,10 +217,8 @@ mod tests {
 
     #[test]
     fn accepts_clean_rust() {
-        let root = PathBuf::from("/tmp");
         let content = "use std::io;\n\nfn main() {\n    println!(\"ok\");\n}\n";
         let result = precheck(
-            &root,
             &task("src/main.rs"),
             &proposal("src/main.rs", content),
             None,
@@ -217,13 +228,59 @@ mod tests {
 
     #[test]
     fn rejects_invalid_json_file() {
-        let root = PathBuf::from("/tmp");
         let result = precheck(
-            &root,
             &task("config.json"),
             &proposal("config.json", "{ \"a\": 1, }"),
             None,
         );
         assert!(result.issues.iter().any(|i| i.contains("JSON")));
+    }
+
+    #[test]
+    fn marker_already_in_the_file_is_not_held_against_the_new_version() {
+        let current = "// TODO: implement caching\nfn main() {\n    run();\n}\n";
+        let updated = "// TODO: implement caching\nfn main() {\n    run();\n    stop();\n}\n";
+        let result = precheck(
+            &task("src/main.rs"),
+            &proposal("src/main.rs", updated),
+            Some(current),
+        );
+        assert!(result.issues.is_empty(), "issues: {:?}", result.issues);
+    }
+
+    #[test]
+    fn plain_use_of_the_word_unchanged_is_fine() {
+        let content = "fn main() {\n    let state_unchanged = true;\n    println!(\"{state_unchanged}\");\n}\n";
+        let result = precheck(&task("a.rs"), &proposal("a.rs", content), None);
+        assert!(result.issues.is_empty(), "issues: {:?}", result.issues);
+    }
+
+    #[test]
+    fn flags_elision_line_and_unchanged_comment() {
+        let elided = "fn a() {\n    // ...\n}\n";
+        let result = precheck(&task("a.rs"), &proposal("a.rs", elided), None);
+        assert!(!result.issues.is_empty());
+
+        let lazy = "fn a() {}\n// rest unchanged\nfn b() {}\n";
+        let result = precheck(&task("a.rs"), &proposal("a.rs", lazy), None);
+        assert!(!result.issues.is_empty());
+    }
+
+    #[test]
+    fn file_names_with_double_dots_are_not_traversal() {
+        let content = "fn main() {\n    println!(\"ok\");\n}\n";
+        let result = precheck(
+            &task("docs/v1..2.md"),
+            &proposal("docs/v1..2.md", content),
+            None,
+        );
+        assert!(result.issues.is_empty(), "issues: {:?}", result.issues);
+    }
+
+    #[test]
+    fn rejects_writing_a_different_file_than_the_task() {
+        let content = "fn main() {\n    println!(\"ok\");\n}\n";
+        let result = precheck(&task("src/a.rs"), &proposal("src/b.rs", content), None);
+        assert!(result.issues.iter().any(|i| i.contains("src/b.rs")));
     }
 }

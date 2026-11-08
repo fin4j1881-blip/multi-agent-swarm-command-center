@@ -1,23 +1,43 @@
 //! The autonomous loop: plan → code → guardrail → review → write.
 //!
-//! Every step is cancellable through `AppState::stop`; the flag is checked
-//! between model calls so a "Durdur" click never kills a half-written file.
+//! Stopping is cooperative but prompt: a "Durdur" click abandons an in-flight
+//! model call (HTTP request or CLI process) immediately. Files are only ever
+//! written between model calls, so a stop can never leave a half-written file.
 
 use crate::config::AgentConfig;
 use crate::guardrail;
 use crate::prompts;
 use crate::protocol::{self, PlanTask};
 use crate::provider::{self, ModelProvider};
-use crate::state::{emit_log, emit_status, now_iso, LogEvent, SharedState};
-use crate::workspace::{self, truncate_chars};
-use std::path::Path;
+use crate::state::{emit_log, emit_status, now_iso, LogEvent, RunStats, SharedState};
+use crate::util::truncate_chars;
+use crate::workspace::{self, FileText};
+use std::future::Future;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tauri::AppHandle;
+
+/// How many of the architect's `contextFiles` are shown to the coder, and how
+/// much of each.
+const CONTEXT_FILES: usize = 3;
+const CONTEXT_FILE_CHARS: usize = 6_000;
+const CARGO_CHECK_TIMEOUT_SECS: u64 = 300;
 
 enum TaskOutcome {
     Applied,
     Rejected(String),
+    /// Could not be attempted; reported back to the architect.
     Skipped(String),
+    /// Approved, but nothing was written (dry-run / auto-apply off).
+    NotWritten,
     Stopped,
+}
+
+enum CallError {
+    Stopped,
+    Failed(String),
 }
 
 pub async fn run(app: AppHandle, shared: SharedState, cfg: AgentConfig) {
@@ -40,535 +60,700 @@ pub async fn run(app: AppHandle, shared: SharedState, cfg: AgentConfig) {
     emit_status(&app, false);
 }
 
+struct Runner<'a> {
+    app: &'a AppHandle,
+    shared: &'a SharedState,
+    cfg: &'a AgentConfig,
+    root: PathBuf,
+    stop: Arc<AtomicBool>,
+    architect: Box<dyn ModelProvider>,
+    coder: Box<dyn ModelProvider>,
+    verify_build: bool,
+}
+
 async fn run_inner(app: &AppHandle, shared: &SharedState, cfg: &AgentConfig) -> Result<(), String> {
     let root = cfg.root()?;
-    emit_log(
-        app,
-        shared,
-        LogEvent::new("info", "system", format!("Proje kökü: {}", root.display())),
-    )
-    .await;
+    let stop = shared.lock().await.stop.clone();
 
-    let architect = provider::build(&cfg.architect, &root)
+    let architect = provider::build(&cfg.architect, &root, "Komutan")
         .map_err(|e| format!("Komutan sağlayıcısı hazırlanamadı: {e}"))?;
-    let coder = provider::build(&cfg.coder, &root)
+    let coder = provider::build(&cfg.coder, &root, "İşçi")
         .map_err(|e| format!("İşçi sağlayıcısı hazırlanamadı: {e}"))?;
 
-    emit_log(
+    let mut runner = Runner {
         app,
         shared,
-        LogEvent::new("info", "system", format!("Komutan → {}", architect.label())),
-    )
-    .await;
-    emit_log(
-        app,
-        shared,
-        LogEvent::new("info", "system", format!("İşçi → {}", coder.label())),
-    )
-    .await;
+        cfg,
+        root,
+        stop,
+        architect,
+        coder,
+        verify_build: cfg.verify_build,
+    };
 
-    let mut completed: Vec<String> = Vec::new();
-    let mut failures: Vec<String> = Vec::new();
-    let rounds = cfg.max_rounds.max(1);
+    runner
+        .log(
+            "info",
+            "system",
+            format!("Proje kökü: {}", runner.root.display()),
+        )
+        .await;
+    runner
+        .log(
+            "info",
+            "system",
+            format!("Komutan → {}", runner.architect.label()),
+        )
+        .await;
+    runner
+        .log("info", "system", format!("İşçi → {}", runner.coder.label()))
+        .await;
 
-    for round in 1..=rounds {
-        if is_stopped(shared).await {
-            emit_log(app, shared, LogEvent::new("warn", "system", "Durduruldu.")).await;
-            return Ok(());
-        }
+    runner.check_build_baseline().await;
+    runner.run_rounds().await
+}
 
-        {
-            let mut guard = shared.lock().await;
-            guard.stats.rounds = round;
-        }
+impl Runner<'_> {
+    async fn log(&self, level: &str, phase: &str, message: impl Into<String>) {
+        emit_log(self.app, self.shared, LogEvent::new(level, phase, message)).await;
+    }
 
+    async fn log_detail(
+        &self,
+        level: &str,
+        phase: &str,
+        message: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
         emit_log(
-            app,
-            shared,
-            LogEvent::new(
+            self.app,
+            self.shared,
+            LogEvent::new(level, phase, message).detail(detail),
+        )
+        .await;
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    async fn update_stats(&self, apply: impl FnOnce(&mut RunStats)) {
+        apply(&mut self.shared.lock().await.stats);
+    }
+
+    /// Runs `work` until it finishes or the user presses "Durdur".
+    /// Dropping the future cancels HTTP requests and kills CLI children.
+    async fn until_stopped<T>(&self, work: impl Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            output = work => Some(output),
+            _ = wait_for_stop(&self.stop) => None,
+        }
+    }
+
+    /// One model call, cancellable, with a log line when the fallback chain
+    /// moves to another model.
+    async fn call(
+        &self,
+        phase: &str,
+        provider: &dyn ModelProvider,
+        prompt: &str,
+        system: &str,
+    ) -> Result<String, CallError> {
+        let before = provider.label();
+        let result = self.until_stopped(provider.complete(prompt, system)).await;
+        let after = provider.label();
+        if before != after {
+            self.log("warn", phase, format!("Model değişti: {before} → {after}"))
+                .await;
+        }
+        match result {
+            None => Err(CallError::Stopped),
+            Some(Ok(text)) => Ok(text),
+            Some(Err(error)) => Err(CallError::Failed(error)),
+        }
+    }
+
+    /// A project that does not compile before we touch it would make every
+    /// write look like a regression and get reverted; disable the gate then.
+    async fn check_build_baseline(&mut self) {
+        if !self.verify_build || !self.root.join("Cargo.toml").exists() {
+            return;
+        }
+        self.log(
+            "info",
+            "system",
+            "Derleme tabanı kontrol ediliyor (cargo check)…",
+        )
+        .await;
+
+        let root = self.root.clone();
+        let outcome = self
+            .until_stopped(workspace::cargo_check(&root, CARGO_CHECK_TIMEOUT_SECS))
+            .await;
+
+        match outcome {
+            Some(Err(error)) => {
+                self.verify_build = false;
+                self.log_detail(
+                    "warn",
+                    "system",
+                    "Proje zaten derlenmiyor; yazma sonrası doğrulama bu çalıştırmada kapatıldı",
+                    error,
+                )
+                .await;
+            }
+            Some(Ok(())) => {
+                self.log("ok", "system", "Derleme tabanı temiz.").await;
+            }
+            None => {}
+        }
+    }
+
+    async fn run_rounds(&self) -> Result<(), String> {
+        let cfg = self.cfg;
+        let mut completed: Vec<String> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+
+        // Without writes the project never changes, so more rounds would only
+        // make the architect plan the same tasks again.
+        let mut rounds = cfg.max_rounds.max(1);
+        if (cfg.dry_run || !cfg.auto_apply) && rounds > 1 {
+            rounds = 1;
+            self.log(
+                "info",
+                "system",
+                "Dosya yazılmayacağı için tek tur çalıştırılıyor.",
+            )
+            .await;
+        }
+
+        for round in 1..=rounds {
+            if self.is_stopped() {
+                self.log("warn", "system", "Durduruldu.").await;
+                return Ok(());
+            }
+            self.update_stats(|s| s.rounds = round).await;
+
+            self.log(
                 "architect",
                 "architect",
                 format!("Tur {round}/{rounds} — proje ağacı taranıyor"),
-            ),
-        )
-        .await;
+            )
+            .await;
 
-        let tree = workspace::scan_tree(&root, cfg.tree_entries);
-        let prompt = prompts::plan_prompt(
-            &cfg.vision,
-            &cfg.instructions,
-            &tree,
-            &completed,
-            &failures,
-            round,
-            rounds,
-        );
+            let tree = {
+                let root = self.root.clone();
+                let limit = cfg.tree_entries;
+                tokio::task::spawn_blocking(move || workspace::scan_tree(&root, limit))
+                    .await
+                    .map_err(|e| format!("Ağaç taraması çöktü: {e}"))?
+            };
+            let prompt = prompts::plan_prompt(
+                &cfg.vision,
+                &cfg.instructions,
+                &tree,
+                &completed,
+                &failures,
+                round,
+                rounds,
+                cfg.max_tasks,
+            );
 
-        let raw_plan = architect
-            .complete(&prompt, &prompts::architect_system(cfg.max_tasks))
-            .await
-            .map_err(|e| format!("Komutan plan üretemedi: {e}"))?;
+            let raw_plan = match self
+                .call(
+                    "architect",
+                    self.architect.as_ref(),
+                    &prompt,
+                    &prompts::architect_system(cfg.max_tasks),
+                )
+                .await
+            {
+                Ok(raw) => raw,
+                Err(CallError::Stopped) => return Ok(()),
+                Err(CallError::Failed(e)) => return Err(format!("Komutan plan üretemedi: {e}")),
+            };
 
-        emit_log(
-            app,
-            shared,
-            LogEvent::new("architect", "architect", "Komutan görev planını üretti")
-                .detail(truncate_chars(&raw_plan, 6000)),
-        )
-        .await;
+            self.log_detail(
+                "architect",
+                "architect",
+                "Komutan görev planını üretti",
+                truncate_chars(&raw_plan, 6000),
+            )
+            .await;
 
-        let plan = match protocol::parse_plan(&raw_plan) {
-            Ok(plan) => plan,
-            Err(error) => {
-                emit_log(
-                    app,
-                    shared,
-                    LogEvent::new("warn", "architect", format!("Plan çözümlenemedi: {error}")),
+            let plan = match protocol::parse_plan(&raw_plan) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.log("warn", "architect", format!("Plan çözümlenemedi: {error}"))
+                        .await;
+                    failures.push(format!("Tur {round}: plan JSON'u geçersiz"));
+                    continue;
+                }
+            };
+
+            if plan.is_complete() || plan.tasks.is_empty() {
+                self.log_detail(
+                    "ok",
+                    "architect",
+                    "Komutan projeyi tamamlandı ilan etti",
+                    plan.summary,
                 )
                 .await;
-                failures.push(format!("Tur {round}: plan JSON'u geçersiz"));
-                continue;
-            }
-        };
-
-        if plan.is_complete() || plan.tasks.is_empty() {
-            emit_log(
-                app,
-                shared,
-                LogEvent::new("ok", "architect", "Komutan projeyi tamamlandı ilan etti")
-                    .detail(plan.summary),
-            )
-            .await;
-            break;
-        }
-
-        let task_count = plan.tasks.len();
-        emit_log(
-            app,
-            shared,
-            LogEvent::new("ok", "architect", format!("{task_count} görev planlandı")),
-        )
-        .await;
-
-        for task in plan.tasks.into_iter().take(cfg.max_tasks.max(1) as usize) {
-            if is_stopped(shared).await {
-                return Ok(());
-            }
-            {
-                let mut guard = shared.lock().await;
-                guard.stats.tasks_total += 1;
+                break;
             }
 
-            let outcome = execute_task(
-                app,
-                shared,
-                cfg,
-                &root,
-                architect.as_ref(),
-                coder.as_ref(),
-                &task,
+            let tasks: Vec<PlanTask> = plan
+                .tasks
+                .into_iter()
+                .take(cfg.max_tasks.max(1) as usize)
+                .collect();
+            self.log(
+                "ok",
+                "architect",
+                format!("{} görev planlandı", tasks.len()),
             )
             .await;
 
-            match outcome {
-                TaskOutcome::Applied => completed.push(format!("{} → {}", task.title, task.file)),
-                TaskOutcome::Rejected(reason) => {
-                    failures.push(format!("{} ({}): {reason}", task.title, task.file))
+            for task in tasks {
+                if self.is_stopped() {
+                    return Ok(());
                 }
-                TaskOutcome::Skipped(reason) => {
-                    failures.push(format!("{} ({}): {reason}", task.title, task.file))
+                self.update_stats(|s| s.tasks_total += 1).await;
+
+                match self.execute_task(&task).await {
+                    TaskOutcome::Applied => {
+                        completed.push(format!("{} → {}", task.title, task.file));
+                    }
+                    TaskOutcome::Rejected(reason) | TaskOutcome::Skipped(reason) => {
+                        failures.push(format!("{} ({}): {reason}", task.title, task.file));
+                    }
+                    TaskOutcome::NotWritten => {
+                        self.update_stats(|s| s.tasks_skipped += 1).await;
+                    }
+                    TaskOutcome::Stopped => return Ok(()),
                 }
-                TaskOutcome::Stopped => return Ok(()),
             }
         }
-    }
 
-    let stats = {
-        let guard = shared.lock().await;
-        guard.stats.clone()
-    };
-    emit_log(
-        app,
-        shared,
-        LogEvent::new(
+        let stats = self.shared.lock().await.stats.clone();
+        self.log(
             "ok",
             "system",
             format!(
-                "Komutanlık bitti — {} görev uygulandı, {} reddedildi, {} dosya yazıldı",
-                stats.tasks_applied, stats.tasks_rejected, stats.files_written
+                "Komutanlık bitti — {} görev uygulandı, {} reddedildi, {} yazılmadı, {} dosya yazıldı",
+                stats.tasks_applied, stats.tasks_rejected, stats.tasks_skipped, stats.files_written
             ),
-        ),
-    )
-    .await;
+        )
+        .await;
 
-    Ok(())
-}
+        Ok(())
+    }
 
-async fn execute_task(
-    app: &AppHandle,
-    shared: &SharedState,
-    cfg: &AgentConfig,
-    root: &Path,
-    architect: &dyn ModelProvider,
-    coder: &dyn ModelProvider,
-    task: &PlanTask,
-) -> TaskOutcome {
-    let file = task.normalized_file();
-    let current = workspace::read_text(root, &file, cfg.context_chars)
-        .await
-        .ok();
+    async fn execute_task(&self, task: &PlanTask) -> TaskOutcome {
+        let cfg = self.cfg;
+        let root = &self.root;
+        let file = task.normalized_file();
 
-    emit_log(
-        app,
-        shared,
-        LogEvent::new("coder", "coder", format!("Görev: {}", task.title)).detail(format!(
-            "Dosya: {file}\nAmaç: {}\nKriterler: {}",
-            task.objective,
-            if task.acceptance_criteria.is_empty() {
-                "-".to_string()
-            } else {
-                task.acceptance_criteria.join(" | ")
-            }
-        )),
-    )
-    .await;
+        // A missing file is a new file; anything else unreadable is an error —
+        // treating it as "new" could overwrite a file we failed to read.
+        let current: Option<FileText> =
+            match workspace::read_existing(root, &file, cfg.context_chars).await {
+                Ok(current) => current,
+                Err(error) => {
+                    self.log("error", "coder", format!("{}: {error}", task.title))
+                        .await;
+                    self.update_stats(|s| s.tasks_rejected += 1).await;
+                    return TaskOutcome::Skipped(error);
+                }
+            };
 
-    let mut feedback = String::new();
-    let max_attempts = cfg.max_attempts.max(1);
-
-    for attempt in 1..=max_attempts {
-        if is_stopped(shared).await {
-            return TaskOutcome::Stopped;
+        // The coder rewrites whole files. Showing it a clipped file would make
+        // it silently delete everything past the cut.
+        if current.as_ref().is_some_and(|c| c.truncated) {
+            let reason = format!(
+                "`{file}` dosyası bağlam sınırından ({} karakter) büyük; tamamı gösterilemeden \
+                 yeniden yazılamaz. Gelişmiş ayarlardan dosya bağlamını artır.",
+                cfg.context_chars
+            );
+            self.log("warn", "coder", format!("{}: {reason}", task.title))
+                .await;
+            self.update_stats(|s| s.tasks_rejected += 1).await;
+            return TaskOutcome::Skipped(reason);
         }
+        let current_text: Option<&str> = current.as_ref().map(|c| c.text.as_str());
 
-        emit_log(
-            app,
-            shared,
-            LogEvent::new(
+        let context_block = workspace::read_context_files(
+            root,
+            &task.context_files,
+            &file,
+            CONTEXT_FILES,
+            CONTEXT_FILE_CHARS,
+        )
+        .await;
+
+        self.log_detail(
+            "coder",
+            "coder",
+            format!("Görev: {}", task.title),
+            format!(
+                "Dosya: {file}\nAmaç: {}\nKriterler: {}",
+                task.objective,
+                if task.acceptance_criteria.is_empty() {
+                    "-".to_string()
+                } else {
+                    task.acceptance_criteria.join(" | ")
+                }
+            ),
+        )
+        .await;
+
+        let mut feedback = String::new();
+        let max_attempts = cfg.max_attempts.max(1);
+
+        for attempt in 1..=max_attempts {
+            if self.is_stopped() {
+                return TaskOutcome::Stopped;
+            }
+
+            self.log(
                 "coder",
                 "coder",
                 format!("{} — deneme {attempt}/{max_attempts}", task.title),
-            ),
-        )
-        .await;
+            )
+            .await;
 
-        let prompt = prompts::coder_prompt(
-            &cfg.vision,
-            &cfg.instructions,
-            task,
-            current.as_deref(),
-            &feedback,
-            attempt,
-            max_attempts,
-        );
+            let prompt = prompts::coder_prompt(
+                &cfg.vision,
+                &cfg.instructions,
+                task,
+                current_text,
+                &context_block,
+                &feedback,
+                attempt,
+                max_attempts,
+            );
 
-        let raw = match coder.complete(&prompt, &prompts::coder_system()).await {
-            Ok(raw) => raw,
-            Err(error) => {
-                emit_log(
-                    app,
-                    shared,
-                    LogEvent::new("error", "coder", format!("İşçi çağrısı başarısız: {error}")),
+            let raw = match self
+                .call(
+                    "coder",
+                    self.coder.as_ref(),
+                    &prompt,
+                    &prompts::coder_system(),
                 )
-                .await;
-                feedback = format!(
-                    "Önceki çağrı teknik olarak başarısız oldu: {error}. Aynı görevi yeniden dene."
-                );
-                continue;
-            }
-        };
+                .await
+            {
+                Ok(raw) => raw,
+                Err(CallError::Stopped) => return TaskOutcome::Stopped,
+                Err(CallError::Failed(error)) => {
+                    self.log("error", "coder", format!("İşçi çağrısı başarısız: {error}"))
+                        .await;
+                    feedback = format!(
+                        "Önceki çağrı teknik olarak başarısız oldu: {error}. Aynı görevi yeniden dene."
+                    );
+                    continue;
+                }
+            };
 
-        emit_log(
-            app,
-            shared,
-            LogEvent::new("coder", "coder", "İşçi kod üretti").detail(truncate_chars(&raw, 8000)),
-        )
-        .await;
+            self.log_detail(
+                "coder",
+                "coder",
+                "İşçi kod üretti",
+                truncate_chars(&raw, 8000),
+            )
+            .await;
 
-        let proposal = match protocol::parse_proposal(&raw, &file) {
-            Ok(proposal) => proposal,
-            Err(error) => {
-                emit_log(
-                    app,
-                    shared,
-                    LogEvent::new("warn", "coder", format!("Kod çözümlenemedi: {error}")),
-                )
-                .await;
-                feedback = format!(
-                    "Yanıt formatı geçersiz: {error}. `### FILE:`, `### SUMMARY:` ve tek bir fenced kod bloğu kullan."
-                );
-                continue;
-            }
-        };
+            let proposal = match protocol::parse_proposal(&raw, &file) {
+                Ok(proposal) => proposal,
+                Err(error) => {
+                    self.log("warn", "coder", format!("Kod çözümlenemedi: {error}"))
+                        .await;
+                    feedback = format!(
+                        "Yanıt formatı geçersiz: {error}. `### FILE:`, `### SUMMARY:` ve tek bir fenced kod bloğu kullan."
+                    );
+                    continue;
+                }
+            };
 
-        let pre = guardrail::precheck(root, task, &proposal, current.as_deref());
-        if !pre.issues.is_empty() {
-            let joined = pre.issues.join("\n- ");
-            emit_log(
-                app,
-                shared,
-                LogEvent::new(
+            let pre = guardrail::precheck(task, &proposal, current_text);
+            if !pre.issues.is_empty() {
+                let joined = pre.issues.join("\n- ");
+                self.log_detail(
                     "warn",
                     "review",
                     format!("Yerel guardrail reddetti (deneme {attempt})"),
+                    format!("- {joined}"),
                 )
-                .detail(format!("- {joined}")),
-            )
-            .await;
-            feedback = format!(
-                "Yerel guardrail şu sorunları buldu:\n- {joined}\nDosyanın tamamını, sorunları gidererek yeniden üret."
-            );
-            bump_revision(shared).await;
-            continue;
-        }
+                .await;
+                feedback = format!(
+                    "Yerel guardrail şu sorunları buldu:\n- {joined}\nDosyanın tamamını, sorunları gidererek yeniden üret."
+                );
+                self.update_stats(|s| s.revisions += 1).await;
+                continue;
+            }
 
-        if !pre.warnings.is_empty() {
-            emit_log(
-                app,
-                shared,
-                LogEvent::new("warn", "review", "Guardrail uyarıları")
-                    .detail(pre.warnings.join("\n")),
-            )
-            .await;
-        }
+            if !pre.warnings.is_empty() {
+                self.log_detail(
+                    "warn",
+                    "review",
+                    "Guardrail uyarıları",
+                    pre.warnings.join("\n"),
+                )
+                .await;
+            }
 
-        emit_log(
-            app,
-            shared,
-            LogEvent::new("review", "review", "Komutan denetliyor…"),
-        )
-        .await;
+            self.log("review", "review", "Komutan denetliyor…").await;
 
-        let review_prompt = prompts::review_prompt(
-            &cfg.vision,
-            task,
-            &proposal,
-            current.as_deref(),
-            &pre.warnings,
-        );
+            let review_prompt =
+                prompts::review_prompt(&cfg.vision, task, &proposal, current_text, &pre.warnings);
 
-        let verdict_raw = match architect
-            .complete(&review_prompt, &prompts::reviewer_system())
-            .await
-        {
-            Ok(raw) => raw,
-            Err(error) => {
-                emit_log(
-                    app,
-                    shared,
-                    LogEvent::new(
+            let verdict_raw = match self
+                .call(
+                    "review",
+                    self.architect.as_ref(),
+                    &review_prompt,
+                    &prompts::reviewer_system(),
+                )
+                .await
+            {
+                Ok(raw) => raw,
+                Err(CallError::Stopped) => return TaskOutcome::Stopped,
+                Err(CallError::Failed(error)) => {
+                    self.log(
                         "error",
                         "review",
                         format!("Denetim çağrısı başarısız: {error}"),
-                    ),
-                )
-                .await;
-                feedback = format!("Denetim teknik olarak başarısız oldu: {error}. Yeniden üret.");
-                continue;
-            }
-        };
+                    )
+                    .await;
+                    feedback =
+                        format!("Denetim teknik olarak başarısız oldu: {error}. Yeniden üret.");
+                    continue;
+                }
+            };
 
-        let verdict = protocol::parse_verdict(&verdict_raw);
-        emit_log(
-            app,
-            shared,
-            LogEvent::new(
+            let verdict = protocol::parse_verdict(&verdict_raw);
+            let headline = if verdict.approved {
+                format!("Komutan ONAYLADI (puan {:.0}/10)", verdict.score)
+            } else {
+                format!("Komutan REDDETTİ (puan {:.0}/10)", verdict.score)
+            };
+            self.log_detail(
                 if verdict.approved { "ok" } else { "warn" },
                 "review",
-                if verdict.approved {
-                    format!("Komutan ONAYLADI (puan {:.0}/10)", verdict.score)
-                } else {
-                    format!("Komutan REDDETTİ (puan {:.0}/10)", verdict.score)
-                },
-            )
-            .detail(format!(
-                "{}\n\n{}",
-                verdict.summary,
-                if verdict.issues.is_empty() {
-                    String::new()
-                } else {
-                    format!("Sorunlar:\n- {}", verdict.issues.join("\n- "))
-                }
-            )),
-        )
-        .await;
-
-        if !verdict.approved {
-            bump_revision(shared).await;
-            feedback = format!(
-                "Komutan reddetti.\nGerekçe: {}\nSorunlar:\n- {}\nDüzeltme talimatı: {}",
-                verdict.summary,
-                if verdict.issues.is_empty() {
-                    "belirtilmedi".to_string()
-                } else {
-                    verdict.issues.join("\n- ")
-                },
-                if verdict.revision.trim().is_empty() {
-                    "Sorunları gider ve dosyanın tamamını yeniden üret."
-                } else {
-                    verdict.revision.as_str()
-                }
-            );
-            continue;
-        }
-
-        if !cfg.auto_apply {
-            emit_log(
-                app,
-                shared,
-                LogEvent::new(
-                    "warn",
-                    "write",
-                    "Otomatik uygulama kapalı; dosya yazılmadı.",
+                headline,
+                format!(
+                    "{}\n\n{}",
+                    verdict.summary,
+                    if verdict.issues.is_empty() {
+                        String::new()
+                    } else {
+                        format!("Sorunlar:\n- {}", verdict.issues.join("\n- "))
+                    }
                 ),
             )
             .await;
-            return TaskOutcome::Skipped("otomatik uygulama kapalı".into());
-        }
 
-        match workspace::write_text(root, &proposal.file, &proposal.content, cfg.dry_run).await {
-            Ok(report) => {
-                if report.dry_run {
-                    emit_log(
-                        app,
-                        shared,
-                        LogEvent::new(
-                            "warn",
-                            "write",
-                            format!(
-                                "Dry-run: `{}` yazılmadı ({} bayt olacaktı).",
-                                report.path.display(),
-                                report.bytes
-                            ),
-                        ),
-                    )
-                    .await;
-                    return TaskOutcome::Skipped("dry-run".into());
-                }
-
-                emit_log(
-                    app,
-                    shared,
-                    LogEvent::new(
-                        "write",
-                        "write",
-                        format!(
-                            "Yazıldı: `{}` ({} bayt, {}){}",
-                            report.path.display(),
-                            report.bytes,
-                            if report.created {
-                                "yeni dosya"
-                            } else {
-                                "güncellendi"
-                            },
-                            if proposal.summary.trim().is_empty() {
-                                String::new()
-                            } else {
-                                format!(" — {}", proposal.summary.trim())
-                            }
-                        ),
-                    ),
-                )
-                .await;
-
-                if let Some(backup) = report.backup.as_ref() {
-                    emit_log(
-                        app,
-                        shared,
-                        LogEvent::new("info", "write", format!("Yedek: {}", backup.display())),
-                    )
-                    .await;
-                }
-
-                if cfg.verify_build {
-                    emit_log(
-                        app,
-                        shared,
-                        LogEvent::new("info", "write", "cargo check çalışıyor…"),
-                    )
-                    .await;
-
-                    if let Err(error) = workspace::cargo_check(root, 300).await {
-                        emit_log(
-                            app,
-                            shared,
-                            LogEvent::new(
-                                "error",
-                                "write",
-                                "Derleme doğrulaması başarısız; değişiklik geri alınıyor",
-                            )
-                            .detail(error.clone()),
-                        )
-                        .await;
-
-                        if let Some(backup) = report.backup.as_ref() {
-                            let _ = workspace::restore(root, &proposal.file, backup).await;
-                        } else {
-                            let _ = workspace::remove(root, &proposal.file).await;
-                        }
-
-                        bump_revision(shared).await;
-                        feedback = format!(
-                            "`cargo check` hataları:\n{error}\nBunları düzelterek dosyanın tamamını yeniden üret."
-                        );
-                        continue;
+            if !verdict.approved {
+                self.update_stats(|s| s.revisions += 1).await;
+                feedback = format!(
+                    "Komutan reddetti.\nGerekçe: {}\nSorunlar:\n- {}\nDüzeltme talimatı: {}",
+                    verdict.summary,
+                    if verdict.issues.is_empty() {
+                        "belirtilmedi".to_string()
+                    } else {
+                        verdict.issues.join("\n- ")
+                    },
+                    if verdict.revision.trim().is_empty() {
+                        "Sorunları gider ve dosyanın tamamını yeniden üret."
+                    } else {
+                        verdict.revision.as_str()
                     }
-
-                    emit_log(
-                        app,
-                        shared,
-                        LogEvent::new("ok", "write", "cargo check temiz."),
-                    )
-                    .await;
-                }
-
-                {
-                    let mut guard = shared.lock().await;
-                    guard.stats.tasks_applied += 1;
-                    guard.stats.files_written += 1;
-                }
-                return TaskOutcome::Applied;
-            }
-            Err(error) => {
-                emit_log(
-                    app,
-                    shared,
-                    LogEvent::new("error", "write", format!("Dosya yazılamadı: {error}")),
-                )
-                .await;
-                feedback = format!("Dosya yazılamadı: {error}. Yolu ve içeriği kontrol et.");
+                );
                 continue;
             }
-        }
-    }
 
-    {
-        let mut guard = shared.lock().await;
-        guard.stats.tasks_rejected += 1;
-    }
-    emit_log(
-        app,
-        shared,
-        LogEvent::new(
+            if !cfg.auto_apply {
+                self.log(
+                    "warn",
+                    "write",
+                    "Otomatik uygulama kapalı; dosya yazılmadı.",
+                )
+                .await;
+                return TaskOutcome::NotWritten;
+            }
+
+            match self.write_and_verify(&proposal, &mut feedback).await {
+                WriteStep::Done => return TaskOutcome::Applied,
+                WriteStep::NotWritten => return TaskOutcome::NotWritten,
+                WriteStep::Retry => continue,
+                WriteStep::Stopped => return TaskOutcome::Stopped,
+            }
+        }
+
+        self.update_stats(|s| s.tasks_rejected += 1).await;
+        self.log(
             "error",
             "review",
             format!(
                 "{}: {max_attempts} denemede onaylanmadı, atlandı.",
                 task.title
             ),
-        ),
-    )
-    .await;
+        )
+        .await;
 
-    TaskOutcome::Rejected(format!("{max_attempts} denemede onaylanmadı"))
+        TaskOutcome::Rejected(format!("{max_attempts} denemede onaylanmadı"))
+    }
+
+    /// Writes an approved proposal and, when enabled, gates it on `cargo check`.
+    async fn write_and_verify(
+        &self,
+        proposal: &protocol::Proposal,
+        feedback: &mut String,
+    ) -> WriteStep {
+        let root = &self.root;
+
+        let report =
+            match workspace::write_text(root, &proposal.file, &proposal.content, self.cfg.dry_run)
+                .await
+            {
+                Ok(report) => report,
+                Err(error) => {
+                    self.log("error", "write", format!("Dosya yazılamadı: {error}"))
+                        .await;
+                    *feedback = format!("Dosya yazılamadı: {error}. Yolu ve içeriği kontrol et.");
+                    return WriteStep::Retry;
+                }
+            };
+
+        if report.dry_run {
+            self.log(
+                "warn",
+                "write",
+                format!(
+                    "Dry-run: `{}` yazılmadı ({} bayt olacaktı).",
+                    report.path.display(),
+                    report.bytes
+                ),
+            )
+            .await;
+            return WriteStep::NotWritten;
+        }
+
+        let summary = proposal.summary.trim();
+        self.log(
+            "write",
+            "write",
+            format!(
+                "Yazıldı: `{}` ({} bayt, {}){}",
+                report.path.display(),
+                report.bytes,
+                if report.created {
+                    "yeni dosya"
+                } else {
+                    "güncellendi"
+                },
+                if summary.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {summary}")
+                }
+            ),
+        )
+        .await;
+
+        if let Some(backup) = report.backup.as_ref() {
+            self.log("info", "write", format!("Yedek: {}", backup.display()))
+                .await;
+        }
+
+        if self.verify_build {
+            self.log("info", "write", "cargo check çalışıyor…").await;
+
+            let checked = self
+                .until_stopped(workspace::cargo_check(root, CARGO_CHECK_TIMEOUT_SECS))
+                .await;
+
+            match checked {
+                None => {
+                    // Unverified code must not survive a stop.
+                    self.revert(proposal, report.backup.as_deref()).await;
+                    return WriteStep::Stopped;
+                }
+                Some(Err(error)) => {
+                    self.log_detail(
+                        "error",
+                        "write",
+                        "Derleme doğrulaması başarısız; değişiklik geri alınıyor",
+                        error.clone(),
+                    )
+                    .await;
+                    self.revert(proposal, report.backup.as_deref()).await;
+                    self.update_stats(|s| s.revisions += 1).await;
+                    *feedback = format!(
+                        "`cargo check` hataları:\n{error}\nBunları düzelterek dosyanın tamamını yeniden üret."
+                    );
+                    return WriteStep::Retry;
+                }
+                Some(Ok(())) => {
+                    self.log("ok", "write", "cargo check temiz.").await;
+                }
+            }
+        }
+
+        self.update_stats(|s| {
+            s.tasks_applied += 1;
+            s.files_written += 1;
+        })
+        .await;
+        WriteStep::Done
+    }
+
+    async fn revert(&self, proposal: &protocol::Proposal, backup: Option<&std::path::Path>) {
+        let result = match backup {
+            Some(backup) => workspace::restore(&self.root, &proposal.file, backup).await,
+            None => workspace::remove(&self.root, &proposal.file).await,
+        };
+        if let Err(error) = result {
+            self.log(
+                "error",
+                "write",
+                format!(
+                    "Geri alma başarısız, `{}` elle kontrol edilmeli: {error}",
+                    proposal.file
+                ),
+            )
+            .await;
+        }
+    }
 }
 
-async fn is_stopped(shared: &SharedState) -> bool {
-    let guard = shared.lock().await;
-    guard.should_stop()
+enum WriteStep {
+    Done,
+    NotWritten,
+    Retry,
+    Stopped,
 }
 
-async fn bump_revision(shared: &SharedState) {
-    let mut guard = shared.lock().await;
-    guard.stats.revisions += 1;
+/// Resolves once the stop flag is raised.
+async fn wait_for_stop(stop: &AtomicBool) {
+    while !stop.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_for_stop_resolves_after_flag() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        tokio::time::timeout(Duration::from_secs(3), wait_for_stop(&stop))
+            .await
+            .expect("stop flag must wake the waiter");
+    }
 }

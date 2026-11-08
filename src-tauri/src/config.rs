@@ -19,7 +19,7 @@ fn default_temperature() -> f32 {
     0.2
 }
 fn default_max_tokens() -> u32 {
-    4096
+    8192
 }
 fn default_true() -> bool {
     true
@@ -134,7 +134,7 @@ impl IdeKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
     #[serde(default)]
@@ -165,6 +165,24 @@ pub struct ProviderConfig {
     pub timeout_secs: u64,
 }
 
+impl std::fmt::Debug for ProviderConfig {
+    /// Hand-written so the API key can never end up in a log line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("source", &self.source)
+            .field("api_kind", &self.api_kind)
+            .field("ide_kind", &self.ide_kind)
+            .field("model", &self.model)
+            .field("fallback_models", &self.fallback_models)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("base_url", &self.base_url)
+            .field("ide_endpoint", &self.ide_endpoint)
+            .field("ide_command", &self.ide_command)
+            .field("ide_args", &self.ide_args)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
@@ -187,18 +205,24 @@ impl Default for ProviderConfig {
 
 impl ProviderConfig {
     pub fn resolve_api_key(&self) -> Option<String> {
-        if let Some(key) = self
-            .api_key
-            .as_ref()
-            .map(|k| k.trim())
-            .filter(|k| !k.is_empty())
-        {
-            return Some(key.to_string());
+        if let Some(key) = self.explicit_api_key() {
+            return Some(key);
         }
         std::env::var(self.api_kind.env_key())
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
+    }
+
+    /// The key typed into the UI, without any environment fallback. Local
+    /// bridges must only ever receive a key the user explicitly gave them, never
+    /// e.g. `OPENROUTER_API_KEY` picked up from the environment.
+    pub fn explicit_api_key(&self) -> Option<String> {
+        self.api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(str::to_string)
     }
 
     pub fn is_custom_endpoint(&self) -> bool {
@@ -254,26 +278,17 @@ impl ProviderConfig {
                         ));
                     }
                 }
-                IdeKind::CustomCli => {
+                IdeKind::CustomCli
                     if self
                         .ide_command
                         .as_deref()
-                        .map(|c| c.trim().is_empty())
-                        .unwrap_or(true)
-                    {
-                        return Err(format!("{role}: Custom CLI için komut adı gerekli."));
-                    }
+                        .map_or(true, |c| c.trim().is_empty()) =>
+                {
+                    return Err(format!("{role}: Custom CLI için komut adı gerekli."));
                 }
-                _ => {
-                    if self
-                        .ide_endpoint
-                        .as_deref()
-                        .map(|e| !e.trim().is_empty())
-                        .unwrap_or(false)
-                    {
-                        // endpoint given: it will be treated as an HTTP bridge, nothing else needed.
-                    }
-                }
+                // Built-in CLI bridges need nothing else; a given endpoint makes
+                // them behave as an HTTP bridge.
+                _ => {}
             },
         }
         Ok(())
@@ -331,6 +346,12 @@ impl AgentConfig {
         self.coder.validate("İşçi")?;
         if self.max_attempts == 0 {
             return Err("maxAttempts en az 1 olmalı.".into());
+        }
+        if self.max_rounds == 0 || self.max_tasks == 0 {
+            return Err("maxRounds ve maxTasks en az 1 olmalı.".into());
+        }
+        if self.context_chars < 1_000 {
+            return Err("contextChars en az 1000 olmalı.".into());
         }
         Ok(root)
     }
