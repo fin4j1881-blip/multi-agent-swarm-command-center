@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="tr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Swarm Command Center</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 48 48" aria-hidden="true">
+          <circle cx="24" cy="24" r="17" fill="none" stroke="currentColor" stroke-width="2.4" opacity="0.85" />
+          <circle cx="24" cy="8" r="3.4" fill="#facc15" />
+          <circle cx="10" cy="33" r="3.4" fill="#facc15" />
+          <circle cx="38" cy="33" r="3.4" fill="#facc15" />
+          <circle cx="24" cy="24" r="4.2" fill="currentColor" />
+          <path d="M24 12v8M13 31l7-5M35 31l-7-5" stroke="currentColor" stroke-width="1.6" opacity="0.55" />
+        </svg>
+        <div>
+          <h1>Swarm Command Center</h1>
+          <p>Hibrit Komutan / İşçi orkestrasyonu · API veya yerel IDE oturumu</p>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <span id="statusPill" class="pill idle">
+          <span class="dot"></span>
+          <span id="statusText">Hazır</span>
+        </span>
+        <button id="stopBtn" class="btn ghost" type="button" disabled>Durdur</button>
+        <button id="startBtn" class="btn primary" type="button">Komutanlığı Başlat</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="config-pane" aria-label="Yapılandırma">
+        <article class="card">
+          <div class="card-head">
+            <div>
+              <span class="eyebrow">Hedef</span>
+              <h2>Proje</h2>
+            </div>
+          </div>
+
+          <label class="field">
+            <span>Proje klasörü</span>
+            <div class="row">
+              <input id="projectPath" type="text" spellcheck="false" placeholder="/home/kullanici/projelerim/uygulama" />
+              <button id="pickFolderBtn" class="btn tiny" type="button">Seç…</button>
+            </div>
+          </label>
+
+          <label class="field">
+            <span>Proje vizyonu <em id="visionCount" class="counter">0</em></span>
+            <textarea id="vision" rows="5" placeholder="Örn: Tauri v2 tabanlı bir not uygulaması. Kullanıcılar not oluşturabilsin, etiketleyebilsin ve arama yapabilsin. Veriler yerel SQLite'ta tutulsun, arayüz sade ve hızlı olsun."></textarea>
+          </label>
+        </article>
+
+        <!-- KOMUTAN -->
+        <article class="card provider-card" data-role="arch">
+          <div class="card-head">
+            <div>
+              <span class="eyebrow">Lider</span>
+              <h2>Komutan Modeli <span class="hint">Architect</span></h2>
+            </div>
+            <button class="btn tiny test-btn" type="button" data-test="arch">Test</button>
+          </div>
+
+          <div class="segmented" data-seg="arch" role="tablist">
+            <button class="seg active" type="button" data-source="api">API</button>
+            <button class="seg" type="button" data-source="ide">IDE / Yerel Oturum</button>
+          </div>
+
+          <div class="fields" data-fields="arch-api">
+            <label class="field">
+              <span>API sağlayıcı</span>
+              <select id="archApiKind">
+                <option value="openrouter">OpenRouter</option>
+                <option value="anthropic">Anthropic (Claude)</option>
+                <option value="openai">OpenAI</option>
+                <option value="deepseek">DeepSeek</option>
+                <option value="custom">Custom (OpenAI uyumlu)</option>
+              </select>
+            </label>
+            <div class="field">
+              <span class="label-row">
+                Model
+                <button class="btn tiny icon-btn" type="button" data-models="arch" title="Model listesini yenile">⟳</button>
+              </span>
+              <select id="archModel">
+                <option value="">— anahtarı gir, liste otomatik gelir —</option>
+              </select>
+              <input id="archModelCustom" class="hidden" type="text" spellcheck="false" placeholder="Özel model adı, ör. deepseek/deepseek-chat" />
+              <em class="field-note" id="archModelNote"></em>
+            </div>
+            <div class="field">
+              <span>Fallback (Yedek) Model <em class="optional">limit bitince geçer</em></span>
+              <select id="archFallbackModel">
+                <option value="">— yok (tek model kullan) —</option>
+              </select>
+            </div>
+            <label class="field">
+              <span>API anahtarı <em class="optional">opsiyonel*</em></span>
+              <div class="row">
+                <input id="archApiKey" type="password" spellcheck="false" autocomplete="off" placeholder="sk-... veya ortam değişkeni" />
+                <button class="btn tiny reveal" type="button" data-reveal="archApiKey">göster</button>
+              </div>
+            </label>
+            <div class="field">
+              <span>Base URL <em class="optional">otomatik</em></span>
+              <div class="row">
+                <input id="archBaseUrl" type="text" spellcheck="false" placeholder="https://openrouter.ai/api/v1" />
+                <button class="btn tiny" type="button" data-reset-base="arch" title="Sağlayıcının varsayılanına dön">sıfırla</button>
+              </div>
+            </div>
+            <p class="note">* Anahtar boşsa <code>OPENROUTER_API_KEY</code>, <code>ANTHROPIC_API_KEY</code>, <code>OPENAI_API_KEY</code> veya <code>DEEPSEEK_API_KEY</code> ortam değişkeni kullanılır.</p>
+          </div>
+
+          <div class="fields hidden" data-fields="arch-ide">
+            <label class="field">
+              <span>IDE / CLI köprüsü</span>
+              <select id="archIdeKind">
+                <option value="opencode">OpenCode CLI</option>
+                <option value="claude_code">Claude Code CLI</option>
+                <option value="cursor_agent">Cursor Agent CLI</option>
+                <option value="custom_http">Custom HTTP köprüsü</option>
+                <option value="custom_cli">Custom CLI</option>
+              </select>
+            </label>
+            <div class="field">
+              <span class="label-row">
+                Model <em class="optional">opsiyonel</em>
+                <button class="btn tiny icon-btn" type="button" data-models="arch" title="Model listesini yenile">⟳</button>
+              </span>
+              <select id="archIdeModel">
+                <option value="">CLI varsayılanı (boş)</option>
+              </select>
+              <input id="archIdeModelCustom" class="hidden" type="text" spellcheck="false" placeholder="Özel model adı" />
+              <em class="field-note" id="archIdeModelNote"></em>
+            </div>
+            <div class="field">
+              <span>Fallback (Yedek) Model <em class="optional">limit bitince geçer</em></span>
+              <select id="archIdeFallbackModel">
+                <option value="">— yok (tek model kullan) —</option>
+              </select>
+            </div>
+            <label class="field" data-ide-endpoint="arch">
+              <span>Endpoint <em class="optional">opsiyonel</em></span>
+              <input id="archIdeEndpoint" type="text" spellcheck="false" placeholder="http://127.0.0.1:4096" />
+            </label>
+            <label class="field hidden" data-ide-command="arch">
+              <span>Komut</span>
+              <input id="archIdeCommand" type="text" spellcheck="false" placeholder="opencode" />
+            </label>
+            <label class="field hidden" data-ide-command="arch">
+              <span>Argümanlar</span>
+              <input id="archIdeArgs" type="text" spellcheck="false" placeholder="run --model openai/gpt-5 {prompt}" />
+            </label>
+            <p class="note" id="archIdeHint"></p>
+          </div>
+        </article>
+
+        <!-- İŞÇİ -->
+        <article class="card provider-card" data-role="coder">
+          <div class="card-head">
+            <div>
+              <span class="eyebrow">Uygulayıcı</span>
+              <h2>İşçi Modeli <span class="hint">Coder</span></h2>
+            </div>
+            <button class="btn tiny test-btn" type="button" data-test="coder">Test</button>
+          </div>
+
+          <div class="segmented" data-seg="coder" role="tablist">
+            <button class="seg active" type="button" data-source="api">API</button>
+            <button class="seg" type="button" data-source="ide">IDE / Yerel Oturum</button>
+          </div>
+
+          <div class="fields" data-fields="coder-api">
+            <label class="field">
+              <span>API sağlayıcı</span>
+              <select id="coderApiKind">
+                <option value="openrouter">OpenRouter</option>
+                <option value="anthropic">Anthropic (Claude)</option>
+                <option value="openai">OpenAI</option>
+                <option value="deepseek">DeepSeek</option>
+                <option value="custom">Custom (OpenAI uyumlu)</option>
+              </select>
+            </label>
+            <div class="field">
+              <span class="label-row">
+                Model
+                <button class="btn tiny icon-btn" type="button" data-models="coder" title="Model listesini yenile">⟳</button>
+              </span>
+              <select id="coderModel">
+                <option value="">— anahtarı gir, liste otomatik gelir —</option>
+              </select>
+              <input id="coderModelCustom" class="hidden" type="text" spellcheck="false" placeholder="Özel model adı, ör. deepseek/deepseek-chat" />
+              <em class="field-note" id="coderModelNote"></em>
+            </div>
+            <div class="field">
+              <span>Fallback (Yedek) Model <em class="optional">limit bitince geçer</em></span>
+              <select id="coderFallbackModel">
+                <option value="">— yok (tek model kullan) —</option>
+              </select>
+            </div>
+            <label class="field">
+              <span>API anahtarı <em class="optional">opsiyonel*</em></span>
+              <div class="row">
+                <input id="coderApiKey" type="password" spellcheck="false" autocomplete="off" placeholder="sk-... veya ortam değişkeni" />
+                <button class="btn tiny reveal" type="button" data-reveal="coderApiKey">göster</button>
+              </div>
+            </label>
+            <div class="field">
+              <span>Base URL <em class="optional">otomatik</em></span>
+              <div class="row">
+                <input id="coderBaseUrl" type="text" spellcheck="false" placeholder="https://api.deepseek.com/v1" />
+                <button class="btn tiny" type="button" data-reset-base="coder" title="Sağlayıcının varsayılanına dön">sıfırla</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="fields hidden" data-fields="coder-ide">
+            <label class="field">
+              <span>IDE / CLI köprüsü</span>
+              <select id="coderIdeKind">
+                <option value="opencode">OpenCode CLI</option>
+                <option value="claude_code">Claude Code CLI</option>
+                <option value="cursor_agent">Cursor Agent CLI</option>
+                <option value="custom_http">Custom HTTP köprüsü</option>
+                <option value="custom_cli">Custom CLI</option>
+              </select>
+            </label>
+            <div class="field">
+              <span class="label-row">
+                Model <em class="optional">opsiyonel</em>
+                <button class="btn tiny icon-btn" type="button" data-models="coder" title="Model listesini yenile">⟳</button>
+              </span>
+              <select id="coderIdeModel">
+                <option value="">CLI varsayılanı (boş)</option>
+              </select>
+              <input id="coderIdeModelCustom" class="hidden" type="text" spellcheck="false" placeholder="Özel model adı" />
+              <em class="field-note" id="coderIdeModelNote"></em>
+            </div>
+            <div class="field">
+              <span>Fallback (Yedek) Model <em class="optional">limit bitince geçer</em></span>
+              <select id="coderIdeFallbackModel">
+                <option value="">— yok (tek model kullan) —</option>
+              </select>
+            </div>
+            <label class="field" data-ide-endpoint="coder">
+              <span>Endpoint <em class="optional">opsiyonel</em></span>
+              <input id="coderIdeEndpoint" type="text" spellcheck="false" placeholder="http://127.0.0.1:4096" />
+            </label>
+            <label class="field hidden" data-ide-command="coder">
+              <span>Komut</span>
+              <input id="coderIdeCommand" type="text" spellcheck="false" placeholder="opencode" />
+            </label>
+            <label class="field hidden" data-ide-command="coder">
+              <span>Argümanlar</span>
+              <input id="coderIdeArgs" type="text" spellcheck="false" placeholder="run --model openai/gpt-5 {prompt}" />
+            </label>
+            <p class="note" id="coderIdeHint"></p>
+          </div>
+        </article>
+
+        <details class="card advanced">
+          <summary>Gelişmiş ayarlar</summary>
+          <div class="grid2">
+            <label class="field">
+              <span>Maks. deneme (görev başına)</span>
+              <input id="maxAttempts" type="number" min="1" max="10" value="3" />
+            </label>
+            <label class="field">
+              <span>Maks. tur</span>
+              <input id="maxRounds" type="number" min="1" max="20" value="3" />
+            </label>
+            <label class="field">
+              <span>Tur başına görev</span>
+              <input id="maxTasks" type="number" min="1" max="20" value="6" />
+            </label>
+            <label class="field">
+              <span>Dosya bağlamı (karakter)</span>
+              <input id="contextChars" type="number" min="2000" max="200000" step="1000" value="24000" />
+            </label>
+          </div>
+          <div class="checks">
+            <label class="check"><input id="autoApply" type="checkbox" checked /> Onaylanan kodu otomatik yaz</label>
+            <label class="check"><input id="dryRun" type="checkbox" /> Dry-run (diske yazma, sadece raporla)</label>
+            <label class="check"><input id="verifyBuild" type="checkbox" /> Yazma sonrası <code>cargo check</code> doğrulaması</label>
+          </div>
+          <p class="note">Onaylanan her dosya yazılmadan önce <code>.swarm/backups/</code> altına yedeklenir. Komutan onaylamazsa dosyaya dokunulmaz.</p>
+        </details>
+      </section>
+
+      <section class="console-pane" aria-label="Canlı konsol">
+        <div class="console-head">
+          <div class="stats">
+            <span class="chip"><b id="statRound">0</b> tur</span>
+            <span class="chip"><b id="statApplied">0</b> uygulandı</span>
+            <span class="chip"><b id="statRejected">0</b> red</span>
+            <span class="chip"><b id="statRevisions">0</b> revizyon</span>
+            <span class="chip"><b id="statFiles">0</b> dosya</span>
+          </div>
+          <div class="console-actions">
+            <label class="check tiny"><input id="autoscroll" type="checkbox" checked /> otomatik kaydır</label>
+            <button id="copyBtn" class="btn tiny" type="button">Kopyala</button>
+            <button id="clearBtn" class="btn tiny" type="button">Temizle</button>
+          </div>
+        </div>
+
+        <div id="console" class="console" role="log" aria-live="polite">
+          <div class="empty">
+            <div class="empty-icon">⌘</div>
+            <p>Komutanlık henüz başlatılmadı.</p>
+            <p class="muted">Proje klasörünü ve vizyonu gir, komutan ve işçi kaynaklarını seç, ardından başlat.</p>
+          </div>
+        </div>
+
+        <div class="console-foot">
+          <span id="footStatus" class="muted">Bekliyor</span>
+          <span class="muted">Yalnızca onaylanan dosyalar yazılır · maks. 3 revizyon</span>
+        </div>
+      </section>
+    </main>
+
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+
+    <script src="main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,15 @@
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# Agent runtime artifacts
+.swarm/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+
+# Local secrets (never commit API keys)
+.env
+.env.local
