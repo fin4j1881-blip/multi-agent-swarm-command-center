@@ -130,7 +130,7 @@ impl IdeKind {
 
     /// CLI bridges that read the prompt from stdin instead of argv.
     pub fn prompt_via_stdin(self) -> bool {
-        matches!(self, Self::ClaudeCode)
+        matches!(self, Self::Opencode | Self::ClaudeCode)
     }
 }
 
