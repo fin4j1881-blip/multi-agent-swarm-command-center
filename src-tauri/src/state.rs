@@ -1,7 +1,7 @@
 //! Shared, thread-safe runtime state plus the log/event plumbing.
 
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
@@ -18,6 +18,8 @@ pub fn now_iso() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogEvent {
+    #[serde(default)]
+    pub project_path: String,
     /// info | ok | warn | error | architect | coder | review | write
     pub level: String,
     /// system | architect | coder | review | write
@@ -31,12 +33,18 @@ pub struct LogEvent {
 impl LogEvent {
     pub fn new(level: &str, phase: &str, message: impl Into<String>) -> Self {
         Self {
+            project_path: String::new(),
             level: level.to_string(),
             phase: phase.to_string(),
             message: message.into(),
             detail: None,
             timestamp: now_hms(),
         }
+    }
+
+    pub fn with_project(mut self, path: impl Into<String>) -> Self {
+        self.project_path = path.into();
+        self
     }
 
     pub fn detail(mut self, detail: impl Into<String>) -> Self {
@@ -65,31 +73,27 @@ pub struct RunStats {
 /// Ring-buffer size of the log replayed to a UI that (re)connects.
 const MAX_LOGS: usize = 800;
 
-pub struct AppState {
+/// Tracks state for a single running or completed project.
+#[derive(Default)]
+pub struct ProjectState {
     pub running: bool,
     pub stop: Arc<AtomicBool>,
     pub logs: VecDeque<LogEvent>,
     pub stats: RunStats,
 }
 
-impl Default for AppState {
-    fn default() -> Self {
-        Self {
-            running: false,
-            stop: Arc::new(AtomicBool::new(false)),
-            logs: VecDeque::new(),
-            stats: RunStats::default(),
-        }
-    }
-}
-
-impl AppState {
+impl ProjectState {
     pub fn push_log(&mut self, event: LogEvent) {
         if self.logs.len() >= MAX_LOGS {
             self.logs.pop_front();
         }
         self.logs.push_back(event);
     }
+}
+
+#[derive(Default)]
+pub struct AppState {
+    pub projects: HashMap<String, ProjectState>,
 }
 
 pub type SharedState = Arc<Mutex<AppState>>;
@@ -102,7 +106,6 @@ pub struct StatusPayload {
     pub logs: Vec<LogEvent>,
 }
 
-/// Cheap status snapshot for the UI's frequent polling (no log history).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatsPayload {
@@ -110,15 +113,20 @@ pub struct StatsPayload {
     pub stats: RunStats,
 }
 
-/// Appends to the in-memory ring buffer and streams the event to the UI.
+/// Appends to the project's in-memory ring buffer and streams the event to the UI.
 pub async fn emit_log(app: &AppHandle, shared: &SharedState, event: LogEvent) {
+    let key = event.project_path.clone();
     {
         let mut guard = shared.lock().await;
-        guard.push_log(event.clone());
+        let p_state = guard.projects.entry(key.clone()).or_default();
+        p_state.push_log(event.clone());
     }
     let _ = app.emit("agent-log", &event);
 }
 
-pub fn emit_status(app: &AppHandle, running: bool) {
-    let _ = app.emit("agent-status", serde_json::json!({ "running": running }));
+pub fn emit_status(app: &AppHandle, project_path: &str, running: bool) {
+    let _ = app.emit(
+        "agent-status",
+        serde_json::json!({ "projectPath": project_path, "running": running }),
+    );
 }

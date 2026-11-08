@@ -41,23 +41,31 @@ enum CallError {
 }
 
 pub async fn run(app: AppHandle, shared: SharedState, cfg: AgentConfig) {
-    let result = run_inner(&app, &shared, &cfg).await;
+    let project_key = cfg
+        .root()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| cfg.project_path.clone());
+
+    let result = run_inner(&app, &shared, &cfg, &project_key).await;
 
     if let Err(error) = result {
         emit_log(
             &app,
             &shared,
-            LogEvent::new("error", "system", format!("Komutanlık durdu: {error}")),
+            LogEvent::new("error", "system", format!("Komutanlık durdu: {error}"))
+                .with_project(&project_key),
         )
         .await;
     }
 
     {
         let mut guard = shared.lock().await;
-        guard.running = false;
-        guard.stats.finished_at = Some(now_iso());
+        if let Some(p) = guard.projects.get_mut(&project_key) {
+            p.running = false;
+            p.stats.finished_at = Some(now_iso());
+        }
     }
-    emit_status(&app, false);
+    emit_status(&app, &project_key, false);
 }
 
 struct Runner<'a> {
@@ -65,15 +73,25 @@ struct Runner<'a> {
     shared: &'a SharedState,
     cfg: &'a AgentConfig,
     root: PathBuf,
+    project_key: String,
     stop: Arc<AtomicBool>,
     architect: Box<dyn ModelProvider>,
     coder: Box<dyn ModelProvider>,
     verify_build: bool,
 }
 
-async fn run_inner(app: &AppHandle, shared: &SharedState, cfg: &AgentConfig) -> Result<(), String> {
+async fn run_inner(
+    app: &AppHandle,
+    shared: &SharedState,
+    cfg: &AgentConfig,
+    project_key: &str,
+) -> Result<(), String> {
     let root = cfg.root()?;
-    let stop = shared.lock().await.stop.clone();
+    let stop = {
+        let mut guard = shared.lock().await;
+        let p = guard.projects.entry(project_key.to_string()).or_default();
+        p.stop.clone()
+    };
 
     let architect = provider::build(&cfg.architect, &root, "Komutan")
         .map_err(|e| format!("Komutan sağlayıcısı hazırlanamadı: {e}"))?;
@@ -85,6 +103,7 @@ async fn run_inner(app: &AppHandle, shared: &SharedState, cfg: &AgentConfig) -> 
         shared,
         cfg,
         root,
+        project_key: project_key.to_string(),
         stop,
         architect,
         coder,
@@ -115,7 +134,12 @@ async fn run_inner(app: &AppHandle, shared: &SharedState, cfg: &AgentConfig) -> 
 
 impl Runner<'_> {
     async fn log(&self, level: &str, phase: &str, message: impl Into<String>) {
-        emit_log(self.app, self.shared, LogEvent::new(level, phase, message)).await;
+        emit_log(
+            self.app,
+            self.shared,
+            LogEvent::new(level, phase, message).with_project(&self.project_key),
+        )
+        .await;
     }
 
     async fn log_detail(
@@ -128,7 +152,9 @@ impl Runner<'_> {
         emit_log(
             self.app,
             self.shared,
-            LogEvent::new(level, phase, message).detail(detail),
+            LogEvent::new(level, phase, message)
+                .detail(detail)
+                .with_project(&self.project_key),
         )
         .await;
     }
@@ -138,7 +164,10 @@ impl Runner<'_> {
     }
 
     async fn update_stats(&self, apply: impl FnOnce(&mut RunStats)) {
-        apply(&mut self.shared.lock().await.stats);
+        let mut guard = self.shared.lock().await;
+        if let Some(p) = guard.projects.get_mut(&self.project_key) {
+            apply(&mut p.stats);
+        }
     }
 
     /// Runs `work` until it finishes or the user presses "Durdur".
@@ -335,7 +364,14 @@ impl Runner<'_> {
             }
         }
 
-        let stats = self.shared.lock().await.stats.clone();
+        let stats = {
+            let guard = self.shared.lock().await;
+            guard
+                .projects
+                .get(&self.project_key)
+                .map(|p| p.stats.clone())
+                .unwrap_or_default()
+        };
         self.log(
             "ok",
             "system",

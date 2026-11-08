@@ -19,7 +19,7 @@ use state::{
 };
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::Mutex;
 
@@ -43,19 +43,22 @@ async fn start_command_center(
 ) -> Result<String, String> {
     let root = config.validate()?;
 
+    let project_key = root.to_string_lossy().to_string();
+
     {
         let mut guard = state.lock().await;
-        if guard.running {
-            return Err("Komutanlık zaten çalışıyor.".into());
+        let p = guard.projects.entry(project_key.clone()).or_default();
+        if p.running {
+            return Err("Bu proje için komutanlık zaten çalışıyor.".into());
         }
-        guard.running = true;
-        guard.stop.store(false, Ordering::SeqCst);
-        guard.logs.clear();
-        guard.stats = Default::default();
-        guard.stats.started_at = Some(now_iso());
+        p.running = true;
+        p.stop.store(false, Ordering::SeqCst);
+        p.logs.clear();
+        p.stats = Default::default();
+        p.stats.started_at = Some(now_iso());
     }
 
-    emit_status(&app, true);
+    emit_status(&app, &project_key, true);
     emit_log(
         &app,
         state.inner(),
@@ -63,7 +66,8 @@ async fn start_command_center(
             "info",
             "system",
             format!("Komutanlık başlatıldı → {}", root.display()),
-        ),
+        )
+        .with_project(&project_key),
     )
     .await;
 
@@ -73,51 +77,83 @@ async fn start_command_center(
         orchestrator::run(handle, shared, config).await;
     });
 
-    Ok(root.to_string_lossy().to_string())
+    Ok(project_key)
 }
 
-/// Requests a cooperative stop. The current model call finishes first.
+/// Requests a cooperative stop for a given project (or all running projects if omitted).
 #[tauri::command]
-async fn stop_command_center(app: AppHandle, state: State<'_, SharedState>) -> Result<(), String> {
-    let running = {
-        let guard = state.lock().await;
-        guard.stop.store(true, Ordering::SeqCst);
-        guard.running
+async fn stop_command_center(
+    app: AppHandle,
+    state: State<'_, SharedState>,
+    project_path: Option<String>,
+) -> Result<(), String> {
+    let mut guard = state.lock().await;
+    let targets: Vec<String> = if let Some(path) = project_path.filter(|p| !p.trim().is_empty()) {
+        vec![path]
+    } else {
+        guard.projects.keys().cloned().collect()
     };
 
-    if running {
-        emit_log(
-            &app,
-            state.inner(),
-            LogEvent::new(
-                "warn",
-                "system",
-                "Durdurma isteği alındı; mevcut adım bitince duracak.",
-            ),
-        )
-        .await;
+    for target in targets {
+        if let Some(p) = guard.projects.get_mut(&target) {
+            if p.running {
+                p.stop.store(true, Ordering::SeqCst);
+                let _ = app.emit(
+                    "agent-log",
+                    &LogEvent::new(
+                        "warn",
+                        "system",
+                        "Durdurma isteği alındı; mevcut adım bitince duracak.",
+                    )
+                    .with_project(&target),
+                );
+            }
+        }
     }
     Ok(())
 }
 
 #[tauri::command]
-async fn get_status(state: State<'_, SharedState>) -> Result<StatusPayload, String> {
+async fn get_status(
+    state: State<'_, SharedState>,
+    project_path: Option<String>,
+) -> Result<StatusPayload, String> {
     let guard = state.lock().await;
-    Ok(StatusPayload {
-        running: guard.running,
-        stats: guard.stats.clone(),
-        logs: guard.logs.iter().cloned().collect(),
-    })
+    let key = project_path.unwrap_or_default();
+    if let Some(p) = guard.projects.get(&key) {
+        Ok(StatusPayload {
+            running: p.running,
+            stats: p.stats.clone(),
+            logs: p.logs.iter().cloned().collect(),
+        })
+    } else {
+        Ok(StatusPayload {
+            running: false,
+            stats: Default::default(),
+            logs: Vec::new(),
+        })
+    }
 }
 
 /// Lightweight variant of `get_status` for frequent polling: no log history.
 #[tauri::command]
-async fn get_stats(state: State<'_, SharedState>) -> Result<StatsPayload, String> {
+async fn get_stats(
+    state: State<'_, SharedState>,
+    project_path: Option<String>,
+) -> Result<StatsPayload, String> {
     let guard = state.lock().await;
-    Ok(StatsPayload {
-        running: guard.running,
-        stats: guard.stats.clone(),
-    })
+    let key = project_path.unwrap_or_default();
+    if let Some(p) = guard.projects.get(&key) {
+        Ok(StatsPayload {
+            running: p.running,
+            stats: p.stats.clone(),
+        })
+    } else {
+        Ok(StatsPayload {
+            running: false,
+            stats: Default::default(),
+        })
+    }
 }
 
 /// Directory model/CLI probes run in: the project if given, else the cwd.

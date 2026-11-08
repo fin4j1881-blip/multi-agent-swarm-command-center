@@ -463,8 +463,10 @@ function scheduleStats() {
   state.statsTimer = setTimeout(async () => {
     state.statsTimer = null;
     try {
-      // get_stats carries no log history, unlike get_status.
-      const status = await invoke("get_stats");
+      const currentPath = $("projectPath").value.trim();
+      const status = await invoke("get_stats", {
+        projectPath: currentPath || null,
+      });
       applyStats(status.stats);
       if (status.running !== state.running) setRunning(status.running);
     } catch {
@@ -543,6 +545,79 @@ function persist() {
       /* storage unavailable */
     }
   }, 300);
+}
+
+const projectRunningMap = {};
+
+function getKnownProjects() {
+  const keys = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("swarm.project.")) {
+        keys.push(k.substring("swarm.project.".length));
+      }
+    }
+  } catch {}
+  const current = $("projectPath")?.value?.trim();
+  if (current && !keys.includes(current)) keys.push(current);
+  return keys.sort();
+}
+
+function renderProjectSidebar() {
+  const listEl = $("projectList");
+  if (!listEl) return;
+  listEl.innerHTML = "";
+
+  const currentPath = $("projectPath")?.value?.trim();
+  const projects = getKnownProjects();
+
+  for (const path of projects) {
+    const item = document.createElement("div");
+    const isRunning = Boolean(projectRunningMap[path]);
+    const isActive = path === currentPath;
+
+    item.className = `project-item ${isActive ? "active" : ""} ${isRunning ? "running" : ""}`;
+
+    const parts = path.split("/").filter(Boolean);
+    const shortName = parts[parts.length - 1] || path;
+
+    item.innerHTML = `
+      <div class="p-name">
+        <span class="p-dot" title="${isRunning ? "Çalışıyor" : "Boşta"}"></span>
+        <span>${shortName}</span>
+      </div>
+      <div class="p-path" title="${path}">${path}</div>
+    `;
+
+    item.addEventListener("click", () => {
+      if (path !== $("projectPath").value.trim()) {
+        switchProject(path);
+      }
+    });
+
+    listEl.appendChild(item);
+  }
+}
+
+async function switchProject(newPath) {
+  persist(); // Save current project
+  $("projectPath").value = newPath;
+  loadProjectData(newPath);
+  renderProjectSidebar();
+
+  // Load status and logs for the switched project
+  try {
+    const status = await invoke("get_status", { projectPath: newPath });
+    applyStats(status.stats);
+    setRunning(Boolean(status.running));
+    clearConsole();
+    if (status.logs?.length) {
+      addLogs(status.logs);
+    }
+  } catch (e) {
+    /* ignore */
+  }
 }
 
 function loadProjectData(path) {
@@ -688,14 +763,15 @@ async function start() {
 
   try {
     const root = await invoke("start_command_center", { config });
+    projectRunningMap[config.projectPath] = true;
+    renderProjectSidebar();
     setRunning(true);
     toast(`Komutanlık başladı: ${root}`, "ok");
   } catch (error) {
     $("startBtn").disabled = false;
     toast(String(error), "error");
-    // A rejected start (e.g. "already running") must not leave the console wiped.
     try {
-      const status = await invoke("get_status");
+      const status = await invoke("get_status", { projectPath: config.projectPath });
       clearConsole();
       addLogs(status.logs);
     } catch {
@@ -705,11 +781,12 @@ async function start() {
 }
 
 async function stop() {
+  const currentPath = $("projectPath").value.trim();
   $("stopBtn").disabled = true;
   $("statusPill").className = "pill stopping";
   $("statusText").textContent = "Durduruluyor…";
   try {
-    await invoke("stop_command_center");
+    await invoke("stop_command_center", { projectPath: currentPath || null });
   } catch (error) {
     toast(String(error), "error");
     setRunning(state.running);
@@ -741,9 +818,13 @@ function bind() {
     }
   });
 
+  const addProjectBtn = $("addProjectSidebarBtn");
+  if (addProjectBtn) addProjectBtn.addEventListener("click", pickFolder);
+
   $("projectPath").addEventListener("change", () => {
     loadProjectData($("projectPath").value);
     persist();
+    renderProjectSidebar();
   });
 
   document.querySelectorAll(".seg").forEach((button) => {
@@ -875,17 +956,34 @@ async function bootstrap() {
   $("maxAttempts").addEventListener("input", updateFootHint);
 
   await listen("agent-log", (event) => {
-    addLogs([event.payload]);
-    scheduleStats();
+    const payload = event.payload;
+    const currentPath = $("projectPath").value.trim();
+    if (!payload.projectPath || payload.projectPath === currentPath) {
+      addLogs([payload]);
+      scheduleStats();
+    }
   });
 
   await listen("agent-status", (event) => {
-    setRunning(Boolean(event.payload?.running));
+    const payload = event.payload;
+    if (payload?.projectPath) {
+      projectRunningMap[payload.projectPath] = Boolean(payload.running);
+      renderProjectSidebar();
+      const currentPath = $("projectPath").value.trim();
+      if (payload.projectPath === currentPath) {
+        setRunning(Boolean(payload.running));
+      }
+    } else {
+      setRunning(Boolean(payload?.running));
+    }
     scheduleStats();
   });
 
+  const currentPath = $("projectPath").value.trim();
+  renderProjectSidebar();
+
   try {
-    const status = await invoke("get_status");
+    const status = await invoke("get_status", { projectPath: currentPath || null });
     applyStats(status.stats);
     setRunning(status.running);
     if (status.logs?.length) {
