@@ -268,6 +268,8 @@ pub async fn emit_log(app: &AppHandle, shared: &SharedState, event: LogEvent) {
         let _ = crate::workspace::save_session(Path::new(&path_str), &session).await;
     }
 
+    crate::journal::record(&event).await;
+
     let _ = app.emit("agent-log", &event);
 }
 

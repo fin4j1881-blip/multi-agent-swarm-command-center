@@ -165,7 +165,8 @@ pub async fn run(app: AppHandle, shared: SharedState, cfg: AgentConfig) {
 
     let result = run_inner(&app, &shared, &cfg, &project_key).await;
 
-    if let Err(error) = result {
+    let failed = result.is_err();
+    if let Err(error) = &result {
         emit_log(
             &app,
             &shared,
@@ -175,13 +176,26 @@ pub async fn run(app: AppHandle, shared: SharedState, cfg: AgentConfig) {
         .await;
     }
 
-    {
+    let (stopped, stats) = {
         let mut guard = shared.lock().await;
-        if let Some(p) = guard.projects.get_mut(&project_key) {
-            p.running = false;
-            p.stats.finished_at = Some(now_iso());
+        match guard.projects.get_mut(&project_key) {
+            Some(p) => {
+                p.running = false;
+                p.stats.finished_at = Some(now_iso());
+                (p.stop.load(Ordering::SeqCst), p.stats.clone())
+            }
+            None => (false, RunStats::default()),
         }
-    }
+    };
+    // Kosu gunlugunu kapat: .swarm/runs/<id>/run.json ve .swarm/last-run.json
+    let status = if failed {
+        "failed"
+    } else if stopped {
+        "stopped"
+    } else {
+        "done"
+    };
+    crate::journal::finish(&project_key, status, &stats).await;
     emit_status(&app, &project_key, false);
 }
 

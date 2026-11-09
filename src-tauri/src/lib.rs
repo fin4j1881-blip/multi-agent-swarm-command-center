@@ -4,6 +4,7 @@ mod api_provider;
 mod config;
 mod guardrail;
 mod ide_bridge;
+mod journal;
 mod models;
 mod orchestrator;
 mod prompts;
@@ -45,6 +46,7 @@ async fn start_command_center(
     let root = config.validate()?;
 
     let project_key = root.to_string_lossy().to_string();
+    let run_id = journal::begin(&root, &config).await;
 
     {
         let mut guard = state.lock().await;
@@ -66,7 +68,10 @@ async fn start_command_center(
         LogEvent::new(
             "info",
             "system",
-            format!("Komutanlık başlatıldı → {}", root.display()),
+            match &run_id {
+                Some(id) => format!("Komutanlık başlatıldı → {} ({id})", root.display()),
+                None => format!("Komutanlık başlatıldı → {}", root.display()),
+            },
         )
         .with_project(&project_key),
     )
