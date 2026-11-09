@@ -24,6 +24,18 @@
       </div>
 
       <div class="topbar-actions">
+        <!-- Tur Süresi ve Performans Sayaçları -->
+        <div class="topbar-metrics">
+          <span class="chip" title="Aktif tur süresi">⏱️ Tur: <b id="roundDuration">00:00</b></span>
+          <span class="chip" title="Tamamlanan turların ortalama süresi">⚡ Ort: <b id="avgDuration">00:00</b></span>
+        </div>
+
+        <!-- Otomatik Git & Heroku Dağıtım Seçenekleri -->
+        <div class="topbar-toggles">
+          <label class="check tiny" title="Başarılı her tur sonunda otomatik Git commit yap"><input id="autoGit" type="checkbox" /> Otomatik Git</label>
+          <label class="check tiny" title="Başarılı her tur sonunda Heroku'ya deploy et"><input id="herokuDeploy" type="checkbox" /> Heroku Deploy</label>
+        </div>
+
         <button id="newWindowBtn" class="btn ghost tiny" type="button" title="Yeni Pencere Aç (Ctrl+N)">+ Yeni Pencere</button>
         <span id="statusPill" class="pill idle">
           <span class="dot"></span>
@@ -103,7 +115,7 @@
             </label>
             <div class="field">
               <span class="label-row">
-                Model
+                Ana Model
                 <button class="btn tiny icon-btn" type="button" data-models="arch" title="Model listesini yenile">⟳</button>
               </span>
               <select id="archModel">
@@ -113,8 +125,14 @@
               <em class="field-note" id="archModelNote"></em>
             </div>
             <div class="field">
-              <span>Fallback (Yedek) Model <em class="optional">limit bitince geçer</em></span>
+              <span>Fallback 1 <em class="optional">limit bitince geçer</em></span>
               <select id="archFallbackModel">
+                <option value="">— yok (tek model kullan) —</option>
+              </select>
+            </div>
+            <div class="field">
+              <span>Fallback 2 <em class="optional">limit bitince geçer</em></span>
+              <select id="archFallback2Model">
                 <option value="">— yok (tek model kullan) —</option>
               </select>
             </div>
@@ -148,7 +166,7 @@
             </label>
             <div class="field">
               <span class="label-row">
-                Model <em class="optional">opsiyonel</em>
+                Ana Model <em class="optional">opsiyonel</em>
                 <button class="btn tiny icon-btn" type="button" data-models="arch" title="Model listesini yenile">⟳</button>
               </span>
               <select id="archIdeModel">
@@ -158,8 +176,14 @@
               <em class="field-note" id="archIdeModelNote"></em>
             </div>
             <div class="field">
-              <span>Fallback (Yedek) Model <em class="optional">limit bitince geçer</em></span>
+              <span>Fallback 1 <em class="optional">limit bitince geçer</em></span>
               <select id="archIdeFallbackModel">
+                <option value="">— yok (tek model kullan) —</option>
+              </select>
+            </div>
+            <div class="field">
+              <span>Fallback 2 <em class="optional">limit bitince geçer</em></span>
+              <select id="archIdeFallback2Model">
                 <option value="">— yok (tek model kullan) —</option>
               </select>
             </div>
@@ -207,7 +231,7 @@
             </label>
             <div class="field">
               <span class="label-row">
-                Model
+                Ana Model
                 <button class="btn tiny icon-btn" type="button" data-models="coder" title="Model listesini yenile">⟳</button>
               </span>
               <select id="coderModel">
@@ -217,8 +241,14 @@
               <em class="field-note" id="coderModelNote"></em>
             </div>
             <div class="field">
-              <span>Fallback (Yedek) Model <em class="optional">limit bitince geçer</em></span>
+              <span>Fallback 1 <em class="optional">limit bitince geçer</em></span>
               <select id="coderFallbackModel">
+                <option value="">— yok (tek model kullan) —</option>
+              </select>
+            </div>
+            <div class="field">
+              <span>Fallback 2 <em class="optional">limit bitince geçer</em></span>
+              <select id="coderFallback2Model">
                 <option value="">— yok (tek model kullan) —</option>
               </select>
             </div>
@@ -251,7 +281,7 @@
             </label>
             <div class="field">
               <span class="label-row">
-                Model <em class="optional">opsiyonel</em>
+                Ana Model <em class="optional">opsiyonel</em>
                 <button class="btn tiny icon-btn" type="button" data-models="coder" title="Model listesini yenile">⟳</button>
               </span>
               <select id="coderIdeModel">
@@ -261,8 +291,14 @@
               <em class="field-note" id="coderIdeModelNote"></em>
             </div>
             <div class="field">
-              <span>Fallback (Yedek) Model <em class="optional">limit bitince geçer</em></span>
+              <span>Fallback 1 <em class="optional">limit bitince geçer</em></span>
               <select id="coderIdeFallbackModel">
+                <option value="">— yok (tek model kullan) —</option>
+              </select>
+            </div>
+            <div class="field">
+              <span>Fallback 2 <em class="optional">limit bitince geçer</em></span>
+              <select id="coderIdeFallback2Model">
                 <option value="">— yok (tek model kullan) —</option>
               </select>
             </div>
@@ -346,6 +382,26 @@
         </div>
       </section>
     </main>
+
+    <!-- DİFF GÖRSELLEŞTİRİCİ MODAL -->
+    <div id="diffModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="diffModalTitle">
+      <div id="diffModalBackdrop" class="modal-backdrop"></div>
+      <div class="modal-content">
+        <div class="modal-header">
+          <div>
+            <h3 id="diffModalTitle">Dosya Farkı (Diff)</h3>
+            <span id="diffFilePath" class="muted tiny"></span>
+          </div>
+          <button id="diffModalCloseBtn" class="btn ghost tiny" type="button" title="Kapat">✕</button>
+        </div>
+        <div class="modal-body">
+          <pre id="diffViewer" class="diff-viewer"><code></code></pre>
+        </div>
+        <div class="modal-footer">
+          <button id="diffModalDismissBtn" class="btn tiny" type="button">Kapat</button>
+        </div>
+      </div>
+    </div>
 
     <div id="toasts" class="toasts" aria-live="polite"></div>
 

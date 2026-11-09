@@ -146,6 +146,10 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub model: String,
     #[serde(default)]
+    pub fallback_1: Option<String>,
+    #[serde(default)]
+    pub fallback_2: Option<String>,
+    #[serde(default)]
     pub fallback_models: Vec<String>,
     #[serde(default)]
     pub api_key: Option<String>,
@@ -173,6 +177,8 @@ impl std::fmt::Debug for ProviderConfig {
             .field("api_kind", &self.api_kind)
             .field("ide_kind", &self.ide_kind)
             .field("model", &self.model)
+            .field("fallback_1", &self.fallback_1)
+            .field("fallback_2", &self.fallback_2)
             .field("fallback_models", &self.fallback_models)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("base_url", &self.base_url)
@@ -190,6 +196,8 @@ impl Default for ProviderConfig {
             api_kind: ApiKind::Openrouter,
             ide_kind: IdeKind::Opencode,
             model: String::new(),
+            fallback_1: None,
+            fallback_2: None,
             fallback_models: Vec::new(),
             api_key: None,
             base_url: None,
@@ -238,6 +246,18 @@ impl ProviderConfig {
         let primary = self.model.trim();
         if !primary.is_empty() {
             models.push(primary.to_string());
+        }
+        if let Some(fb1) = &self.fallback_1 {
+            let fb1 = fb1.trim();
+            if !fb1.is_empty() && !models.iter().any(|m| m == fb1) {
+                models.push(fb1.to_string());
+            }
+        }
+        if let Some(fb2) = &self.fallback_2 {
+            let fb2 = fb2.trim();
+            if !fb2.is_empty() && !models.iter().any(|m| m == fb2) {
+                models.push(fb2.to_string());
+            }
         }
         for fb in &self.fallback_models {
             let fb = fb.trim();
@@ -321,6 +341,10 @@ pub struct AgentConfig {
     /// Run `cargo check` after each write and revert the file on failure.
     #[serde(default)]
     pub verify_build: bool,
+    #[serde(default)]
+    pub auto_git: bool,
+    #[serde(default)]
+    pub heroku_deploy: bool,
 }
 
 impl AgentConfig {

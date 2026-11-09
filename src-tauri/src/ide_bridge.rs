@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 enum Transport {
@@ -475,15 +475,43 @@ impl IdeBridgeProvider {
             }
         }
 
-        let output = tokio::time::timeout(self.timeout, child.wait_with_output())
-            .await
-            .map_err(|_| {
-                format!(
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+
+        let read_output = async {
+            let stdout_fut = async {
+                if let Some(mut reader) = stdout_pipe {
+                    let _ = reader.read_to_end(&mut stdout_buf).await;
+                }
+            };
+            let stderr_fut = async {
+                if let Some(mut reader) = stderr_pipe {
+                    let _ = reader.read_to_end(&mut stderr_buf).await;
+                }
+            };
+
+            let (status, _, _) = tokio::join!(child.wait(), stdout_fut, stderr_fut);
+            let status = status?;
+            Ok::<_, std::io::Error>(std::process::Output {
+                status,
+                stdout: stdout_buf,
+                stderr: stderr_buf,
+            })
+        };
+
+        let output = match tokio::time::timeout(self.timeout, read_output).await {
+            Ok(res) => res.map_err(|e| format!("CLI çıktısı okunamadı: {e}"))?,
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(format!(
                     "'{program}' {} saniye içinde yanıt vermedi; süreç öldürüldü.",
                     self.timeout.as_secs()
-                )
-            })?
-            .map_err(|e| format!("CLI çıktısı okunamadı: {e}"))?;
+                ));
+            }
+        };
 
         let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
         let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
@@ -649,6 +677,23 @@ mod tests {
         let output = provider.complete("merhaba", "sistem").await.unwrap();
         assert!(output.contains("merhaba"));
         assert!(output.contains("sistem"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_timeout_kills_child() {
+        let cfg = ProviderConfig {
+            source: ProviderSource::Ide,
+            ide_kind: IdeKind::CustomCli,
+            ide_command: Some("sleep".into()),
+            ide_args: vec!["{prompt}".into()],
+            ..Default::default()
+        };
+        let mut provider =
+            IdeBridgeProvider::new(&cfg, std::path::Path::new(".")).expect("provider");
+        provider.timeout = Duration::from_millis(50);
+        let err = provider.complete("2", "").await.unwrap_err();
+        assert!(err.contains("süreç öldürüldü"));
     }
 
     #[test]

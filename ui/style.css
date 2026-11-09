@@ -94,6 +94,37 @@ body {
   flex: 0 0 auto;
 }
 
+/* Üst bar sayaçları ve performans metrikleri */
+.topbar-metrics {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.topbar-metrics .chip {
+  background: rgba(10, 18, 33, 0.85);
+  border-color: rgba(34, 211, 238, 0.25);
+  font-size: 11px;
+}
+
+.topbar-metrics .chip b {
+  color: var(--accent);
+  margin-left: 2px;
+}
+
+/* Üst bar otomatik işlem geçiş onay kutuları */
+.topbar-toggles {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 2px;
+}
+
+.topbar-toggles .check {
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 .pill {
   display: inline-flex;
   align-items: center;
@@ -912,6 +943,225 @@ select {
 
 .muted {
   color: var(--muted-2);
+}
+
+/* ---------- diff modal & visualizer ---------- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(4, 8, 16, 0.78);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 100;
+  animation: fadein 0.15s ease-out;
+}
+
+.modal-overlay.hidden,
+.diff-modal.hidden {
+  display: none !important;
+}
+
+.modal-dialog,
+.diff-modal {
+  background: linear-gradient(180deg, #0e172a, #090f1d);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  width: 100%;
+  max-width: 860px;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 24px 60px -20px rgba(0, 0, 0, 0.95), 0 0 0 1px rgba(34, 211, 238, 0.12);
+  overflow: hidden;
+  animation: modalzoom 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes modalzoom {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line-soft);
+  background: rgba(11, 18, 33, 0.75);
+  flex: 0 0 auto;
+}
+
+.modal-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.modal-title .file-badge {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: rgba(34, 211, 238, 0.1);
+  border: 1px solid rgba(34, 211, 238, 0.25);
+  color: var(--accent);
+}
+
+.modal-close {
+  appearance: none;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 6px;
+  line-height: 1;
+  transition: color 0.15s, background 0.15s;
+}
+
+.modal-close:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 16px;
+  scrollbar-width: thin;
+  scrollbar-color: #24344f transparent;
+}
+
+.modal-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line-soft);
+  background: rgba(9, 15, 27, 0.7);
+  flex: 0 0 auto;
+}
+
+.diff-view,
+.diff-container {
+  background: #060a14;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  overflow-x: auto;
+  padding: 6px 0;
+  margin: 0;
+}
+
+.diff-line {
+  display: flex;
+  padding: 1px 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Eklenen (+ yeşil) diff satır stilleri */
+.diff-line.added,
+.diff-line.add,
+.diff-line-add,
+.diff-add {
+  background: rgba(52, 211, 153, 0.12);
+  color: #a7f3d0;
+  border-left: 3px solid var(--ok);
+}
+
+.diff-line.added .diff-marker,
+.diff-add .diff-marker {
+  color: var(--ok);
+  font-weight: 700;
+  user-select: none;
+  margin-right: 8px;
+}
+
+/* Silinen (- kırmızı) diff satır stilleri */
+.diff-line.removed,
+.diff-line.del,
+.diff-line-del,
+.diff-del {
+  background: rgba(248, 113, 113, 0.12);
+  color: #fecaca;
+  border-left: 3px solid var(--err);
+}
+
+.diff-line.removed .diff-marker,
+.diff-del .diff-marker {
+  color: var(--err);
+  font-weight: 700;
+  user-select: none;
+  margin-right: 8px;
+}
+
+/* Diff üstbilgi ve bağlam satırları */
+.diff-line.header,
+.diff-line.meta,
+.diff-header {
+  color: var(--accent-2);
+  background: rgba(129, 140, 248, 0.08);
+  font-weight: 600;
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
+.diff-line.unchanged,
+.diff-line.ctx {
+  color: var(--muted);
+}
+
+/* pre blokları içindeki diff renklendirme desteği */
+pre.diff-code {
+  background: #060a14;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  padding: 10px 12px;
+  overflow: auto;
+  max-height: 520px;
+  margin: 0;
+}
+
+pre.diff-code .diff-add {
+  color: #a7f3d0;
+  background: rgba(52, 211, 153, 0.12);
+  display: block;
+  margin: 0 -12px;
+  padding: 0 12px;
+  border-left: 3px solid var(--ok);
+}
+
+pre.diff-code .diff-del {
+  color: #fecaca;
+  background: rgba(248, 113, 113, 0.12);
+  display: block;
+  margin: 0 -12px;
+  padding: 0 12px;
+  border-left: 3px solid var(--err);
 }
 
 /* ---------- toasts ---------- */

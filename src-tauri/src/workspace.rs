@@ -1,6 +1,8 @@
 //! Filesystem access is funnelled through here so the agent can never escape
 //! the selected project root.
 
+use crate::models::SessionData;
+use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -40,6 +42,30 @@ const SKIP_EXTS: &[&str] = &[
 const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 
 const ALLOWED_DOT_DIRS: &[&str] = &[".github", ".vscode", ".config"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiffKind {
+    Added,
+    Removed,
+    Same,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffLine {
+    pub kind: DiffKind,
+    pub text: String,
+}
+
+impl DiffLine {
+    pub fn new(kind: DiffKind, text: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: text.into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WriteReport {
@@ -88,6 +114,7 @@ pub async fn read_project_overview(root: &Path) -> String {
 
     out
 }
+
 pub fn normalize_rel(rel: &str) -> Result<String, String> {
     let cleaned = rel
         .trim()
@@ -278,6 +305,34 @@ pub async fn read_context_files(
     block
 }
 
+/// Loads `.swarm/session.json` if present; returns [`SessionData::default`] if missing or unreadable.
+pub async fn load_session(root: &Path) -> SessionData {
+    let path = root.join(".swarm").join("session.json");
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        return SessionData::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+/// Atomically saves [`SessionData`] to `.swarm/session.json`, creating the `.swarm`
+/// directory if needed.
+pub async fn save_session(root: &Path, session: &SessionData) -> Result<(), String> {
+    let swarm_dir = root.join(".swarm");
+    if let Err(e) = tokio::fs::create_dir_all(&swarm_dir).await {
+        return Err(format!(".swarm dizini oluşturulamadı: {e}"));
+    }
+
+    let target = swarm_dir.join("session.json");
+    let bytes = serde_json::to_vec_pretty(session)
+        .map_err(|e| format!("session verisi serileştirilemedi: {e}"))?;
+
+    write_atomic(&target, &bytes)
+        .await
+        .map_err(|e| format!("session.json yazılamadı: {e}"))?;
+
+    Ok(())
+}
+
 /// Writes the file atomically enough for an editor to pick up the change, after
 /// snapshotting the previous version under `.swarm/backups/<stamp>/`.
 pub async fn write_text(
@@ -360,6 +415,113 @@ pub async fn write_text(
         created: !existed,
         dry_run: false,
     })
+}
+
+/// Locates the most recent backup file under `.swarm/backups/<stamp>/<rel>`.
+pub async fn find_latest_backup(root: &Path, rel: &str) -> Result<Option<PathBuf>, String> {
+    let cleaned = normalize_rel(rel)?;
+    let backups_dir = root.join(".swarm").join("backups");
+    let mut dir = match tokio::fs::read_dir(&backups_dir).await {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("Yedek dizini okunamadı: {e}")),
+    };
+
+    let mut stamps = Vec::new();
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        if let Ok(file_type) = entry.file_type().await {
+            if file_type.is_dir() {
+                stamps.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+    }
+
+    stamps.sort();
+    for stamp in stamps.into_iter().rev() {
+        let candidate = backups_dir.join(stamp).join(&cleaned);
+        if tokio::fs::metadata(&candidate).await.is_ok() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Calculates line-by-line differences between the latest backup and current file.
+pub async fn calculate_file_diff(root: &Path, rel: &str) -> Result<Vec<DiffLine>, String> {
+    let cleaned = normalize_rel(rel)?;
+    let current_path = safe_join(root, &cleaned)?;
+    ensure_inside(root, &current_path).await?;
+
+    let backup_path = find_latest_backup(root, &cleaned).await?;
+
+    let backup_text = match backup_path {
+        Some(path) => {
+            ensure_inside(root, &path).await?;
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                Err(e) => return Err(format!("Yedek dosya okunamadı: {e}")),
+            }
+        }
+        None => return Ok(Vec::new()),
+    };
+
+    let current_text = match tokio::fs::read(&current_path).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("Güncel dosya okunamadı: {e}")),
+    };
+
+    let old_lines: Vec<&str> = backup_text.lines().collect();
+    let new_lines: Vec<&str> = current_text.lines().collect();
+
+    Ok(compute_line_diff(&old_lines, &new_lines))
+}
+
+fn compute_line_diff<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<DiffLine> {
+    let n = old.len();
+    let m = new.len();
+
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in 0..n {
+        for j in 0..m {
+            if old[i] == new[j] {
+                dp[i + 1][j + 1] = dp[i][j] + 1;
+            } else {
+                dp[i + 1][j + 1] = dp[i + 1][j].max(dp[i][j + 1]);
+            }
+        }
+    }
+
+    let mut diff = Vec::new();
+    let mut i = n;
+    let mut j = m;
+
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && old[i - 1] == new[j - 1] {
+            diff.push(DiffLine {
+                kind: DiffKind::Same,
+                text: old[i - 1].to_string(),
+            });
+            i -= 1;
+            j -= 1;
+        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
+            diff.push(DiffLine {
+                kind: DiffKind::Added,
+                text: new[j - 1].to_string(),
+            });
+            j -= 1;
+        } else if i > 0 && (j == 0 || dp[i][j - 1] < dp[i - 1][j]) {
+            diff.push(DiffLine {
+                kind: DiffKind::Removed,
+                text: old[i - 1].to_string(),
+            });
+            i -= 1;
+        }
+    }
+
+    diff.reverse();
+    diff
 }
 
 /// Writes through a sibling temp file and renames it over the target, so an
@@ -464,6 +626,147 @@ async fn ensure_inside(root: &Path, path: &Path) -> Result<(), String> {
             path.display()
         ))
     }
+}
+
+/// Ensures .gitignore contains exclusions for sensitive or generated paths:
+/// `.env`, `target/`, and `.swarm/`.
+pub async fn ensure_gitignore(root: &Path) -> Result<(), String> {
+    let gitignore_path = root.join(".gitignore");
+    let content = if gitignore_path.exists() {
+        tokio::fs::read_to_string(&gitignore_path)
+            .await
+            .map_err(|e| format!(".gitignore okunamadı: {e}"))?
+    } else {
+        String::new()
+    };
+
+    let required_entries = [".env", "target/", ".swarm/"];
+    let mut to_add = Vec::new();
+
+    for req in required_entries {
+        let trimmed_req = req.trim_end_matches('/');
+        let found = content.lines().any(|line| {
+            let t = line.trim();
+            t == req || t == trimmed_req || t == format!("{trimmed_req}/")
+        });
+        if !found {
+            to_add.push(req);
+        }
+    }
+
+    if !to_add.is_empty() {
+        let mut new_content = content;
+        if !new_content.is_empty() && !new_content.ends_with('\n') {
+            new_content.push('\n');
+        }
+        for item in to_add {
+            new_content.push_str(item);
+            new_content.push('\n');
+        }
+        write_atomic(&gitignore_path, new_content.as_bytes())
+            .await
+            .map_err(|e| format!(".gitignore yazılamadı: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Automatically commits changes at the end of a successful round with format
+/// `swarm(tur-{tur}): {gorev}` and optionally pushes to `heroku main`.
+/// Guarantees that `.env`, `target/`, and `.swarm/` remain untracked.
+pub async fn git_commit_and_push(
+    root: &Path,
+    tur: u32,
+    gorev: &str,
+    heroku_push: bool,
+) -> Result<String, String> {
+    if !root.join(".git").exists() {
+        return Err("Git deposu bulunamadı (.git dizini mevcut değil).".into());
+    }
+
+    // 1. Ensure exclusions in .gitignore
+    ensure_gitignore(root).await?;
+
+    // 2. Unstage ignored paths in case they were previously staged
+    let mut rm_cmd = tokio::process::Command::new("git");
+    rm_cmd
+        .args(["rm", "--cached", "-r", "--ignore-unmatch", ".env", "target", ".swarm"])
+        .current_dir(root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let _ = rm_cmd.status().await;
+
+    // 3. Stage changes
+    let mut add_cmd = tokio::process::Command::new("git");
+    add_cmd
+        .arg("add")
+        .arg("-A")
+        .current_dir(root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let add_out = tokio::time::timeout(std::time::Duration::from_secs(15), add_cmd.output())
+        .await
+        .map_err(|_| "git add zaman aşımına uğradı.".to_string())?
+        .map_err(|e| format!("git add başlatılamadı: {e}"))?;
+
+    if !add_out.status.success() {
+        let err = String::from_utf8_lossy(&add_out.stderr);
+        return Err(format!("git add başarısız: {err}"));
+    }
+
+    // 4. Commit
+    let commit_msg = format!("swarm(tur-{tur}): {gorev}");
+    let mut commit_cmd = tokio::process::Command::new("git");
+    commit_cmd
+        .arg("commit")
+        .arg("-m")
+        .arg(&commit_msg)
+        .current_dir(root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let commit_out = tokio::time::timeout(std::time::Duration::from_secs(15), commit_cmd.output())
+        .await
+        .map_err(|_| "git commit zaman aşımına uğradı.".to_string())?
+        .map_err(|e| format!("git commit başlatılamadı: {e}"))?;
+
+    let commit_stdout = String::from_utf8_lossy(&commit_out.stdout);
+    let commit_stderr = String::from_utf8_lossy(&commit_out.stderr);
+
+    if !commit_out.status.success() {
+        let combined = format!("{commit_stdout} {commit_stderr}");
+        if combined.contains("nothing to commit") || combined.contains("working tree clean") {
+            return Ok(format!("Değişiklik yok: {commit_msg}"));
+        }
+        return Err(format!("git commit başarısız: {}", commit_stderr.trim()));
+    }
+
+    // 5. Optional Heroku push
+    if heroku_push {
+        let mut push_cmd = tokio::process::Command::new("git");
+        push_cmd
+            .args(["push", "heroku", "main"])
+            .current_dir(root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+
+        let push_out = tokio::time::timeout(std::time::Duration::from_secs(60), push_cmd.output())
+            .await
+            .map_err(|_| "git push heroku main zaman aşımına uğradı.".to_string())?
+            .map_err(|e| format!("git push heroku main başlatılamadı: {e}"))?;
+
+        if !push_out.status.success() {
+            let err = String::from_utf8_lossy(&push_out.stderr);
+            return Err(format!("git push heroku main başarısız: {err}"));
+        }
+    }
+
+    Ok(commit_msg)
 }
 
 #[cfg(test)]
@@ -575,6 +878,128 @@ mod tests {
         let block = read_context_files(&root, &files, "a.rs", 3, 100).await;
         assert!(block.contains("fn b()"));
         assert!(!block.contains("fn a()"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn session_load_returns_default_when_missing() {
+        let root = temp_root("session-missing");
+        let session = load_session(&root).await;
+        assert_eq!(session, SessionData::default());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn session_save_and_load_roundtrip() {
+        let root = temp_root("session-rt");
+        let mut session = SessionData::default();
+        session.stats.tur = 3;
+        session.stats.uygulandi = 2;
+
+        save_session(&root, &session).await.expect("save session");
+
+        assert!(root.join(".swarm").join("session.json").exists());
+
+        let loaded = load_session(&root).await;
+        assert_eq!(loaded.stats.tur, 3);
+        assert_eq!(loaded.stats.uygulandi, 2);
+        assert_eq!(loaded, session);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn calculate_file_diff_detects_changes() {
+        let root = temp_root("diff-changes");
+        write_text(&root, "code.rs", "satir1\nsatir2\n", false)
+            .await
+            .unwrap();
+        write_text(&root, "code.rs", "satir1\nsatir2 guncel\nsatir3\n", false)
+            .await
+            .unwrap();
+
+        let diff = calculate_file_diff(&root, "code.rs").await.unwrap();
+        assert!(!diff.is_empty());
+        assert!(diff.iter().any(|d| d.kind == DiffKind::Removed && d.text == "satir2"));
+        assert!(diff.iter().any(|d| d.kind == DiffKind::Added && d.text == "satir2 guncel"));
+        assert!(diff.iter().any(|d| d.kind == DiffKind::Added && d.text == "satir3"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn calculate_file_diff_returns_empty_when_no_backup() {
+        let root = temp_root("diff-empty");
+        write_text(&root, "initial.rs", "satir1\n", false)
+            .await
+            .unwrap();
+
+        let diff = calculate_file_diff(&root, "initial.rs").await.unwrap();
+        assert!(diff.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn ensure_gitignore_adds_missing_entries() {
+        let root = temp_root("gitignore-test");
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        ensure_gitignore(&root).await.unwrap();
+
+        let content = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(content.contains(".env"));
+        assert!(content.contains("target/"));
+        assert!(content.contains(".swarm/"));
+
+        // Idempotent test
+        ensure_gitignore(&root).await.unwrap();
+        let content2 = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert_eq!(content, content2);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn git_commit_and_push_creates_commit_with_format() {
+        let root = temp_root("git-commit-test");
+        // Initialize dummy git repo
+        let _ = tokio::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .await;
+        let _ = tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&root)
+            .output()
+            .await;
+        let _ = tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(&root)
+            .output()
+            .await;
+
+        std::fs::write(root.join("hello.txt"), "hello").unwrap();
+        std::fs::write(root.join(".env"), "SECRET=123").unwrap();
+
+        let res = git_commit_and_push(&root, 1, "test commit", false).await;
+        assert!(res.is_ok(), "git_commit_and_push failed: {:?}", res);
+
+        let log_out = tokio::process::Command::new("git")
+            .args(["log", "-1", "--pretty=%B"])
+            .current_dir(&root)
+            .output()
+            .await
+            .unwrap();
+        let log_msg = String::from_utf8_lossy(&log_out.stdout);
+        assert!(log_msg.contains("swarm(tur-1): test commit"));
+
+        // Verify .env is untracked
+        let status_out = tokio::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&root)
+            .output()
+            .await
+            .unwrap();
+        let status = String::from_utf8_lossy(&status_out.stdout);
+        assert!(!status.contains(".env"));
+
         std::fs::remove_dir_all(&root).ok();
     }
 }

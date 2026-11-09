@@ -6,7 +6,7 @@
 
 use crate::config::{ApiKind, IdeKind, ProviderConfig, ProviderSource};
 use crate::util::snippet;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
@@ -41,6 +41,165 @@ pub struct ModelCatalog {
     /// api | http | cli | static
     pub source: String,
     pub note: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStats {
+    #[serde(default, alias = "rounds", alias = "round")]
+    pub tur: u32,
+    #[serde(default, alias = "applied", alias = "tasks_applied", alias = "tasksApplied")]
+    pub uygulandi: u32,
+    #[serde(default, alias = "red", alias = "rejected", alias = "tasks_rejected", alias = "tasksRejected")]
+    pub red: u32,
+    #[serde(default, alias = "yazilmadi", alias = "skipped", alias = "tasks_skipped", alias = "tasksSkipped")]
+    pub yazilmadi: u32,
+    #[serde(default, alias = "revisions", alias = "revision")]
+    pub revizyon: u32,
+    #[serde(default, alias = "dosya", alias = "files", alias = "files_written", alias = "filesWritten")]
+    pub dosya: u32,
+}
+
+impl Default for SessionStats {
+    fn default() -> Self {
+        Self {
+            tur: 0,
+            uygulandi: 0,
+            red: 0,
+            yazilmadi: 0,
+            revizyon: 0,
+            dosya: 0,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl SessionStats {
+    pub fn new(
+        tur: u32,
+        uygulandi: u32,
+        red: u32,
+        yazilmadi: u32,
+        revizyon: u32,
+        dosya: u32,
+    ) -> Self {
+        Self {
+            tur,
+            uygulandi,
+            red,
+            yazilmadi,
+            revizyon,
+            dosya,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogEntry {
+    #[serde(default)]
+    pub project_path: String,
+    #[serde(default)]
+    pub level: String,
+    #[serde(default)]
+    pub phase: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub timestamp: String,
+}
+
+#[allow(dead_code)]
+impl LogEntry {
+    pub fn new(
+        level: impl Into<String>,
+        phase: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            project_path: String::new(),
+            level: level.into(),
+            phase: phase.into(),
+            message: message.into(),
+            detail: None,
+            timestamp: String::new(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionData {
+    #[serde(default, alias = "session_stats", alias = "istatistikler")]
+    pub stats: SessionStats,
+    #[serde(default, alias = "loglar", alias = "log_history", alias = "logHistory")]
+    pub logs: Vec<LogEntry>,
+}
+
+#[allow(dead_code)]
+impl SessionData {
+    pub fn new(stats: SessionStats, logs: Vec<LogEntry>) -> Self {
+        Self { stats, logs }
+    }
+}
+
+impl From<crate::state::RunStats> for SessionStats {
+    fn from(r: crate::state::RunStats) -> Self {
+        Self {
+            tur: r.rounds,
+            uygulandi: r.tasks_applied,
+            red: r.tasks_rejected,
+            yazilmadi: r.tasks_skipped,
+            revizyon: r.revisions,
+            dosya: r.files_written,
+        }
+    }
+}
+
+impl From<SessionStats> for crate::state::RunStats {
+    fn from(s: SessionStats) -> Self {
+        Self {
+            rounds: s.tur,
+            tasks_total: s.uygulandi + s.red + s.yazilmadi,
+            tasks_applied: s.uygulandi,
+            tasks_rejected: s.red,
+            tasks_skipped: s.yazilmadi,
+            files_written: s.dosya,
+            revisions: s.revizyon,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+}
+
+impl From<crate::state::LogEvent> for LogEntry {
+    fn from(e: crate::state::LogEvent) -> Self {
+        Self {
+            project_path: e.project_path,
+            level: e.level,
+            phase: e.phase,
+            message: e.message,
+            detail: e.detail,
+            timestamp: e.timestamp,
+        }
+    }
+}
+
+impl From<LogEntry> for crate::state::LogEvent {
+    fn from(e: LogEntry) -> Self {
+        Self {
+            project_path: e.project_path,
+            level: e.level,
+            phase: e.phase,
+            message: e.message,
+            detail: e.detail,
+            timestamp: e.timestamp,
+        }
+    }
 }
 
 pub async fn list_models(cfg: &ProviderConfig, project_dir: &Path) -> Result<ModelCatalog, String> {
@@ -492,6 +651,50 @@ mod tests {
     fn rejects_garbage() {
         assert!(parse_models("not json").is_err());
         assert!(parse_models(r#"{"foo":1}"#).is_err());
+    }
+
+    #[test]
+    fn session_stats_and_data_serde_roundtrip() {
+        let stats = SessionStats::new(5, 4, 1, 0, 2, 3);
+        let logs = vec![
+            LogEntry::new("info", "system", "Oturum başladı"),
+            LogEntry {
+                project_path: "/test".into(),
+                level: "ok".into(),
+                phase: "coder".into(),
+                message: "Görev tamamlandı".into(),
+                detail: Some("Ayrıntı".into()),
+                timestamp: "10:00:00".into(),
+            },
+        ];
+        let session = SessionData::new(stats.clone(), logs);
+
+        let serialized = serde_json::to_string(&session).unwrap();
+        let deserialized: SessionData = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.stats, stats);
+        assert_eq!(deserialized.logs.len(), 2);
+        assert_eq!(deserialized.logs[0].message, "Oturum başladı");
+        assert_eq!(deserialized.logs[1].detail.as_deref(), Some("Ayrıntı"));
+    }
+
+    #[test]
+    fn session_stats_aliases_and_defaults() {
+        let raw = r#"{
+            "rounds": 10,
+            "tasksApplied": 8,
+            "tasksRejected": 2,
+            "tasksSkipped": 1,
+            "revision": 3,
+            "files": 7
+        }"#;
+        let stats: SessionStats = serde_json::from_str(raw).unwrap();
+        assert_eq!(stats.tur, 10);
+        assert_eq!(stats.uygulandi, 8);
+        assert_eq!(stats.red, 2);
+        assert_eq!(stats.yazilmadi, 1);
+        assert_eq!(stats.revizyon, 3);
+        assert_eq!(stats.dosya, 7);
     }
 
     #[tokio::test]

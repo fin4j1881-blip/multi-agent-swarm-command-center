@@ -12,6 +12,11 @@ const state = {
   logs: [],
   statsTimer: null,
   saveTimer: null,
+  roundTimer: null,
+  currentRound: 0,
+  roundStartTime: null,
+  completedRoundDurations: [],
+  lastWrittenFile: null,
 };
 
 const IDE_HINTS = {
@@ -41,6 +46,242 @@ function toast(message, level = "ok") {
     el.style.transition = "opacity .2s";
     setTimeout(() => el.remove(), 220);
   }, level === "error" ? 9000 : 5000);
+}
+
+/* ---------------- round timer & performance ---------------- */
+
+function formatDuration(totalSeconds) {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const mins = Math.floor(s / 60);
+  const secs = s % 60;
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
+function updateDurationCounters() {
+  const roundEl = $("roundDuration");
+  const avgEl = $("avgDuration");
+
+  if (state.running && state.roundStartTime) {
+    const elapsed = (Date.now() - state.roundStartTime) / 1000;
+    if (roundEl) roundEl.textContent = formatDuration(elapsed);
+  } else if (!state.running) {
+    if (roundEl) roundEl.textContent = "00:00";
+  }
+
+  if (avgEl) {
+    if (state.completedRoundDurations.length > 0) {
+      const sum = state.completedRoundDurations.reduce((a, b) => a + b, 0);
+      const avg = sum / state.completedRoundDurations.length;
+      avgEl.textContent = formatDuration(avg);
+    } else {
+      avgEl.textContent = "00:00";
+    }
+  }
+}
+
+function startDurationTimer() {
+  if (state.roundTimer) clearInterval(state.roundTimer);
+  if (!state.roundStartTime) state.roundStartTime = Date.now();
+  updateDurationCounters();
+  state.roundTimer = setInterval(updateDurationCounters, 1000);
+}
+
+function stopDurationTimer() {
+  if (state.roundTimer) {
+    clearInterval(state.roundTimer);
+    state.roundTimer = null;
+  }
+  if (state.roundStartTime) {
+    const elapsed = Math.round((Date.now() - state.roundStartTime) / 1000);
+    if (elapsed > 0) {
+      state.completedRoundDurations.push(elapsed);
+    }
+    state.roundStartTime = null;
+  }
+  updateDurationCounters();
+}
+
+/* ---------------- diff modal & visualizer ---------------- */
+
+function extractFilePath(event) {
+  if (!event) return "";
+  if (event.filePath) return event.filePath;
+  if (event.file) return event.file;
+  if (event.path) return event.path;
+
+  const msg = event.message || "";
+  const detail = event.detail || "";
+
+  // Check backticked path: `src/main.rs`
+  const backtickMatch = msg.match(/`([^`]+)`/) || detail.match(/`([^`]+)`/);
+  if (backtickMatch && backtickMatch[1].includes(".")) {
+    return backtickMatch[1].trim();
+  }
+
+  // Check brackets: [src/main.rs]
+  const bracketMatch = msg.match(/\[([^\]]+)\]/) || detail.match(/\[([^\]]+)\]/);
+  if (bracketMatch && bracketMatch[1].includes(".")) {
+    return bracketMatch[1].trim();
+  }
+
+  // Check FILE: or Dosya:
+  const filePrefixMatch = (msg + "\n" + detail).match(/(?:FILE|Dosya|dosya):\s*`?([^\s`\r\n]+)/i);
+  if (filePrefixMatch) {
+    return filePrefixMatch[1].trim();
+  }
+
+  // Check common file extension pattern
+  const extMatch = (msg + "\n" + detail).match(/\b([\w/.-]+\.(?:rs|js|ts|html|css|json|toml|py|md|txt))\b/i);
+  if (extMatch) {
+    return extMatch[1].trim();
+  }
+
+  return "";
+}
+
+function openDiffModal(filePath, diffData) {
+  const modal = $("diffModal");
+  if (!modal) return;
+
+  const titleEl = $("diffModalTitle");
+  if (titleEl) {
+    titleEl.textContent = "Dosya Farkı (Diff)";
+  }
+
+  const pathEl = $("diffFilePath");
+  if (pathEl) {
+    pathEl.textContent = filePath ? `· ${filePath}` : "";
+  }
+
+  const viewer = $("diffViewer");
+  if (viewer) {
+    let code = viewer.querySelector("code");
+    if (!code) {
+      code = document.createElement("code");
+      viewer.appendChild(code);
+    }
+    code.innerHTML = "";
+    code.className = "diff-container";
+
+    let lines = [];
+    if (typeof diffData === "string") {
+      try {
+        const parsed = JSON.parse(diffData);
+        if (Array.isArray(parsed)) {
+          lines = parsed;
+        } else {
+          lines = diffData.split(/\r?\n/);
+        }
+      } catch {
+        lines = diffData.split(/\r?\n/);
+      }
+    } else if (Array.isArray(diffData)) {
+      lines = diffData;
+    }
+
+    if (!lines || lines.length === 0) {
+      const emptyDiv = document.createElement("div");
+      emptyDiv.className = "diff-line unchanged";
+      emptyDiv.style.color = "var(--muted)";
+      emptyDiv.style.padding = "8px 12px";
+      emptyDiv.textContent = "— Değişiklik veya önceki yedek bulunamadı —";
+      code.appendChild(emptyDiv);
+    } else {
+      for (const item of lines) {
+        const lineEl = document.createElement("div");
+        lineEl.className = "diff-line";
+
+        let kind = "same";
+        let text = "";
+
+        if (typeof item === "string") {
+          if (item.startsWith("+") && !item.startsWith("+++")) {
+            kind = "added";
+            text = item.slice(1);
+          } else if (item.startsWith("-") && !item.startsWith("---")) {
+            kind = "removed";
+            text = item.slice(1);
+          } else if (item.startsWith("@@")) {
+            kind = "header";
+            text = item;
+          } else {
+            kind = "same";
+            text = item.startsWith(" ") ? item.slice(1) : item;
+          }
+        } else if (item && typeof item === "object") {
+          kind = String(item.kind || "same").toLowerCase();
+          text = item.text ?? "";
+        }
+
+        const markerEl = document.createElement("span");
+        markerEl.className = "diff-marker";
+        const textEl = document.createElement("span");
+        textEl.className = "diff-text";
+        textEl.textContent = text;
+
+        if (kind === "added" || kind === "add") {
+          lineEl.classList.add("added", "diff-add");
+          lineEl.style.color = "var(--ok)";
+          lineEl.style.backgroundColor = "rgba(52, 211, 153, 0.12)";
+          lineEl.style.borderLeft = "3px solid var(--ok)";
+          markerEl.textContent = "+ ";
+          markerEl.style.color = "var(--ok)";
+          markerEl.style.fontWeight = "700";
+        } else if (kind === "removed" || kind === "del") {
+          lineEl.classList.add("removed", "diff-del");
+          lineEl.style.color = "var(--err)";
+          lineEl.style.backgroundColor = "rgba(248, 113, 113, 0.12)";
+          lineEl.style.borderLeft = "3px solid var(--err)";
+          markerEl.textContent = "- ";
+          markerEl.style.color = "var(--err)";
+          markerEl.style.fontWeight = "700";
+        } else if (kind === "header") {
+          lineEl.classList.add("header", "diff-header");
+          lineEl.style.color = "var(--accent-2)";
+          markerEl.textContent = "@@ ";
+        } else {
+          lineEl.classList.add("unchanged");
+          lineEl.style.color = "var(--muted)";
+          markerEl.textContent = "   ";
+        }
+
+        markerEl.style.marginRight = "8px";
+        lineEl.appendChild(markerEl);
+        lineEl.appendChild(textEl);
+        code.appendChild(lineEl);
+      }
+    }
+  }
+
+  modal.classList.remove("hidden");
+  modal.classList.add("modal-overlay");
+}
+
+function closeDiffModal() {
+  const modal = $("diffModal");
+  if (modal) {
+    modal.classList.add("hidden");
+  }
+}
+
+async function openDiffForEvent(event) {
+  const filePath = extractFilePath(event) || state.lastWrittenFile || "";
+  if (filePath) {
+    state.lastWrittenFile = filePath;
+  }
+  const currentPath = $("projectPath")?.value?.trim() || null;
+
+  if (!invoke) return;
+
+  try {
+    const res = await invoke("get_file_diff", {
+      filePath: filePath || "code.rs",
+      projectPath: currentPath,
+    });
+    openDiffModal(filePath, res);
+  } catch (err) {
+    openDiffModal(filePath, [{ kind: "same", text: `Diff alınamadı: ${err}` }]);
+  }
 }
 
 /* ---------------- provider form ---------------- */
@@ -340,6 +581,8 @@ function buildConfig() {
     autoApply: $("autoApply").checked,
     dryRun: $("dryRun").checked,
     verifyBuild: $("verifyBuild").checked,
+    autoGit: $("autoGit") ? $("autoGit").checked : false,
+    herokuDeploy: $("herokuDeploy") ? $("herokuDeploy").checked : false,
   };
 }
 
@@ -391,10 +634,20 @@ function buildLogRow(event) {
   text.textContent = event.message || "";
   msg.appendChild(text);
 
+  const filePath = extractFilePath(event);
+  if (filePath) {
+    state.lastWrittenFile = filePath;
+  }
+
   if (event.detail) {
     const details = document.createElement("details");
     const summary = document.createElement("summary");
     summary.textContent = "detay";
+    summary.style.cursor = "pointer";
+    summary.title = "Farkları görüntüle (Diff)";
+    summary.addEventListener("click", () => {
+      openDiffForEvent(event);
+    });
     const pre = document.createElement("pre");
     pre.textContent = event.detail;
     details.append(summary, pre);
@@ -433,29 +686,74 @@ function clearConsole() {
 /* ---------------- status & stats ---------------- */
 
 function setRunning(running) {
+  const wasRunning = state.running;
   state.running = running;
 
   const pill = $("statusPill");
-  pill.className = `pill ${running ? "running" : "idle"}`;
-  $("statusText").textContent = running ? "Çalışıyor" : "Hazır";
-  $("startBtn").disabled = running;
-  $("stopBtn").disabled = !running;
-  $("footStatus").textContent = running ? "Ajan döngüsü aktif" : "Bekliyor";
+  if (pill) pill.className = `pill ${running ? "running" : "idle"}`;
+  const statusText = $("statusText");
+  if (statusText) statusText.textContent = running ? "Çalışıyor" : "Hazır";
+  const startBtn = $("startBtn");
+  if (startBtn) startBtn.disabled = running;
+  const stopBtn = $("stopBtn");
+  if (stopBtn) stopBtn.disabled = !running;
+  const footStatus = $("footStatus");
+  if (footStatus) footStatus.textContent = running ? "Ajan döngüsü aktif" : "Bekliyor";
+
+  if (running && !wasRunning) {
+    state.roundStartTime = Date.now();
+    startDurationTimer();
+  } else if (!running && wasRunning) {
+    stopDurationTimer();
+  }
 }
 
 function updateFootHint() {
   const attempts = Number($("maxAttempts").value) || 3;
-  $("footHint").textContent = `Yalnızca onaylanan dosyalar yazılır · görev başına maks. ${attempts} deneme`;
+  const footHint = $("footHint");
+  if (footHint) {
+    footHint.textContent = `Yalnızca onaylanan dosyalar yazılır · görev başına maks. ${attempts} deneme`;
+  }
 }
 
 function applyStats(stats) {
   if (!stats) return;
-  $("statRound").textContent = stats.rounds ?? 0;
-  $("statApplied").textContent = stats.tasksApplied ?? 0;
-  $("statRejected").textContent = stats.tasksRejected ?? 0;
-  $("statSkipped").textContent = stats.tasksSkipped ?? 0;
-  $("statRevisions").textContent = stats.revisions ?? 0;
-  $("statFiles").textContent = stats.filesWritten ?? 0;
+  const s = stats.stats || stats;
+  const newRound = Number(s.rounds ?? s.round ?? s.tur ?? 0);
+  if (newRound > state.currentRound) {
+    if (state.currentRound > 0 && state.roundStartTime) {
+      const elapsed = Math.round((Date.now() - state.roundStartTime) / 1000);
+      if (elapsed > 0) {
+        state.completedRoundDurations.push(elapsed);
+      }
+      state.roundStartTime = Date.now();
+    }
+    state.currentRound = newRound;
+    updateDurationCounters();
+  }
+
+  if (state.running && !state.roundTimer) {
+    startDurationTimer();
+  }
+
+  if ($("statRound")) $("statRound").textContent = s.rounds ?? s.round ?? s.tur ?? 0;
+  if ($("statApplied")) $("statApplied").textContent = s.tasksApplied ?? s.tasks_applied ?? s.applied ?? s.uygulandi ?? 0;
+  if ($("statRejected")) $("statRejected").textContent = s.tasksRejected ?? s.tasks_rejected ?? s.rejected ?? s.red ?? 0;
+  if ($("statSkipped")) $("statSkipped").textContent = s.tasksSkipped ?? s.tasks_skipped ?? s.skipped ?? s.yazilmadi ?? 0;
+  if ($("statRevisions")) $("statRevisions").textContent = s.revisions ?? s.revision ?? s.revizyon ?? 0;
+  if ($("statFiles")) $("statFiles").textContent = s.filesWritten ?? s.files_written ?? s.files ?? s.dosya ?? 0;
+}
+
+async function fetchSessionStatus(projectPath) {
+  try {
+    return await invoke("get_status", { projectPath: projectPath || null });
+  } catch (err) {
+    try {
+      return await invoke("get_session", { projectPath: projectPath || null });
+    } catch {
+      throw err;
+    }
+  }
 }
 
 function scheduleStats() {
@@ -467,8 +765,10 @@ function scheduleStats() {
       const status = await invoke("get_stats", {
         projectPath: currentPath || null,
       });
-      applyStats(status.stats);
-      if (status.running !== state.running) setRunning(status.running);
+      applyStats(status?.stats || status);
+      if (typeof status?.running === "boolean" && status.running !== state.running) {
+        setRunning(status.running);
+      }
     } catch {
       /* ignore transient IPC errors */
     }
@@ -684,14 +984,26 @@ async function switchProject(newPath) {
   loadProjectData(newPath);
   renderProjectSidebar();
 
+  // Reset duration tracking on project switch
+  state.completedRoundDurations = [];
+  state.roundStartTime = null;
+  if (state.roundTimer) {
+    clearInterval(state.roundTimer);
+    state.roundTimer = null;
+  }
+  updateDurationCounters();
+
   // Load status and logs for the switched project
   try {
-    const status = await invoke("get_status", { projectPath: newPath });
-    applyStats(status.stats);
-    setRunning(Boolean(status.running));
-    clearConsole();
-    if (status.logs?.length) {
-      addLogs(status.logs);
+    const status = await fetchSessionStatus(newPath);
+    if (status) {
+      applyStats(status.stats || status.session?.stats || status);
+      setRunning(Boolean(status.running));
+      clearConsole();
+      const logs = status.logs || status.session?.logs || status.history;
+      if (logs && logs.length) {
+        addLogs(logs);
+      }
     }
   } catch (e) {
     /* ignore */
@@ -794,10 +1106,25 @@ async function pickFolder() {
         persist();
         renderProjectSidebar();
       } else {
-        // Yeni bir proje eklendi! Otomatik AI analizi teklif et ve çalıştır
         renderProjectSidebar();
         persist();
         triggerAiProjectAnalysis();
+      }
+
+      // Sync session for the newly picked folder
+      try {
+        const status = await fetchSessionStatus(folder);
+        if (status) {
+          applyStats(status.stats || status.session?.stats || status);
+          setRunning(Boolean(status.running));
+          clearConsole();
+          const logs = status.logs || status.session?.logs || status.history;
+          if (logs && logs.length) {
+            addLogs(logs);
+          }
+        }
+      } catch {
+        /* ignore */
       }
     }
   } catch (error) {
@@ -847,8 +1174,6 @@ async function start() {
   }
 
   $("startBtn").disabled = true;
-  clearConsole();
-  applyStats({});
 
   try {
     const root = await invoke("start_command_center", { config });
@@ -860,11 +1185,14 @@ async function start() {
     $("startBtn").disabled = false;
     toast(String(error), "error");
     try {
-      const status = await invoke("get_status", { projectPath: config.projectPath });
-      clearConsole();
-      addLogs(status.logs);
+      const status = await fetchSessionStatus(config.projectPath);
+      if (status?.stats) applyStats(status.stats || status.session?.stats || status);
+      const logs = status?.logs || status?.session?.logs || status?.history;
+      if (logs?.length && state.logs.length === 0) {
+        addLogs(logs);
+      }
     } catch {
-      /* keep the empty console */
+      /* keep the existing console */
     }
   }
 }
@@ -888,6 +1216,34 @@ function bind() {
   $("pickFolderBtn").addEventListener("click", pickFolder);
   $("startBtn").addEventListener("click", start);
   $("stopBtn").addEventListener("click", stop);
+
+  const modal = $("diffModal");
+  const closeBtn = $("diffModalCloseBtn");
+  const dismissBtn = $("diffModalDismissBtn");
+  const backdrop = $("diffModalBackdrop");
+
+  if (closeBtn) closeBtn.addEventListener("click", closeDiffModal);
+  if (dismissBtn) dismissBtn.addEventListener("click", closeDiffModal);
+  if (backdrop) backdrop.addEventListener("click", closeDiffModal);
+
+  if (modal) {
+    modal.addEventListener("click", (e) => {
+      if (
+        e.target === modal ||
+        e.target === backdrop ||
+        e.target.classList.contains("modal-backdrop") ||
+        e.target.classList.contains("modal-overlay")
+      ) {
+        closeDiffModal();
+      }
+    });
+  }
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      closeDiffModal();
+    }
+  });
 
   const aiAnalyzeBtn = $("aiAnalyzeBtn");
   if (aiAnalyzeBtn) aiAnalyzeBtn.addEventListener("click", triggerAiProjectAnalysis);
@@ -914,9 +1270,21 @@ function bind() {
   if (addProjectBtn) addProjectBtn.addEventListener("click", pickFolder);
 
   $("projectPath").addEventListener("change", () => {
-    loadProjectData($("projectPath").value);
+    const path = $("projectPath").value;
+    loadProjectData(path);
     persist();
     renderProjectSidebar();
+    fetchSessionStatus(path)
+      .then((status) => {
+        if (status) {
+          applyStats(status.stats || status.session?.stats || status);
+          const logs = status.logs || status.session?.logs || status.history;
+          if (logs && logs.length && state.logs.length === 0) {
+            addLogs(logs);
+          }
+        }
+      })
+      .catch(() => {});
   });
 
   document.querySelectorAll(".seg").forEach((button) => {
@@ -1075,12 +1443,19 @@ async function bootstrap() {
   renderProjectSidebar();
 
   try {
-    const status = await invoke("get_status", { projectPath: currentPath || null });
-    applyStats(status.stats);
-    setRunning(status.running);
-    if (status.logs?.length) {
-      state.logs = [];
-      addLogs(status.logs);
+    const status = await fetchSessionStatus(currentPath);
+    if (status) {
+      applyStats(status.stats || status.session?.stats || status);
+      if (typeof status.running === "boolean") {
+        setRunning(status.running);
+      }
+      const logs = status.logs || status.session?.logs || status.history;
+      if (logs && logs.length) {
+        state.logs = [];
+        const host = consoleEl();
+        if (host) host.innerHTML = "";
+        addLogs(logs);
+      }
     }
   } catch (error) {
     toast(`Durum okunamadı: ${error}`, "warn");

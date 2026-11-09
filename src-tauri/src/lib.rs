@@ -287,6 +287,23 @@ Yanıtını YALNIZCA şu JSON formatında ver, başka hiçbir metin veya markdow
     })
 }
 
+/// Computes line-by-line differences between the latest backup and current file.
+#[tauri::command]
+async fn get_file_diff(
+    file_path: String,
+    project_path: Option<String>,
+) -> Result<String, String> {
+    let root = probe_dir(project_path);
+    let rel_path = if let Ok(rel) = std::path::Path::new(&file_path).strip_prefix(&root) {
+        rel.to_string_lossy().to_string()
+    } else {
+        file_path
+    };
+
+    let diff = workspace::calculate_file_diff(&root, &rel_path).await?;
+    serde_json::to_string(&diff).map_err(|e| format!("Diff serileştirilemedi: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let shared: SharedState = Arc::new(Mutex::new(AppState::default()));
@@ -303,8 +320,27 @@ pub fn run() {
             check_provider,
             list_models,
             open_new_window,
-            analyze_project
+            analyze_project,
+            get_file_diff
         ])
         .run(tauri::generate_context!())
         .expect("Tauri uygulaması başlatılamadı");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_get_file_diff_returns_json() {
+        let dir = std::env::temp_dir().join(format!("swarm-diff-test-{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+
+        let res = get_file_diff("code.rs".into(), Some(dir.to_string_lossy().to_string())).await;
+        assert!(res.is_ok());
+        let val = res.unwrap();
+        assert_eq!(val, "[]");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 }
