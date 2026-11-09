@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -41,6 +42,26 @@ enum Transport {
 /// Largest single argv entry we pass. Linux caps one argument at 128 KiB
 /// (MAX_ARG_STRLEN) and Windows caps the whole command line at ~32 K chars.
 const MAX_ARGV_BYTES: usize = if cfg!(windows) { 30_000 } else { 120_000 };
+
+/// How long a CLI may stay completely silent before we treat it as stuck.
+///
+/// A dead endpoint or an unresponsive model accepts the process, prints
+/// nothing and never returns; without this guard the user only sees a spinner
+/// until the (much longer) total timeout. A model that is actually working
+/// prints a step header almost immediately, so silence is a reliable signal.
+const FIRST_OUTPUT_SECS: u64 = 180;
+
+/// How often the CLI watchdog checks for silence.
+const WATCHDOG_TICK_SECS: u64 = 5;
+
+/// Seconds for normal limits, milliseconds for very short ones (tests).
+fn human_duration(d: Duration) -> String {
+    if d.as_secs() > 0 {
+        format!("{} saniye", d.as_secs())
+    } else {
+        format!("{} ms", d.as_millis())
+    }
+}
 
 /// Resolves the binary for a built-in CLI bridge.
 ///
@@ -478,22 +499,47 @@ impl IdeBridgeProvider {
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
 
-        let mut stdout_buf = Vec::new();
-        let mut stderr_buf = Vec::new();
+        // Bytes seen so far, so the watchdog can tell "still working" from "stuck".
+        let seen = std::sync::Arc::new(AtomicU64::new(0));
+
+        let seen_out = seen.clone();
+        let stdout_fut = async move {
+            let mut buf = Vec::new();
+            if let Some(mut reader) = stdout_pipe {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match reader.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            seen_out.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            buf
+        };
+        let seen_err = seen.clone();
+        let stderr_fut = async move {
+            let mut buf = Vec::new();
+            if let Some(mut reader) = stderr_pipe {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match reader.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            seen_err.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            buf
+        };
 
         let read_output = async {
-            let stdout_fut = async {
-                if let Some(mut reader) = stdout_pipe {
-                    let _ = reader.read_to_end(&mut stdout_buf).await;
-                }
-            };
-            let stderr_fut = async {
-                if let Some(mut reader) = stderr_pipe {
-                    let _ = reader.read_to_end(&mut stderr_buf).await;
-                }
-            };
-
-            let (status, _, _) = tokio::join!(child.wait(), stdout_fut, stderr_fut);
+            let (status, stdout_buf, stderr_buf) =
+                tokio::join!(child.wait(), stdout_fut, stderr_fut);
             let status = status?;
             Ok::<_, std::io::Error>(std::process::Output {
                 status,
@@ -502,14 +548,36 @@ impl IdeBridgeProvider {
             })
         };
 
-        let output = match tokio::time::timeout(self.timeout, read_output).await {
-            Ok(res) => res.map_err(|e| format!("CLI çıktısı okunamadı: {e}"))?,
-            Err(_) => {
-                let _ = child.kill().await;
-                return Err(format!(
-                    "'{program}' {} saniye içinde yanıt vermedi; süreç öldürüldü.",
-                    self.timeout.as_secs()
-                ));
+        // Watchdog: total timeout plus an "it never said anything" guard, so a
+        // dead model surfaces as a clear error instead of an endless spinner.
+        // Dropping this future kills the child (`kill_on_drop`).
+        tokio::pin!(read_output);
+        let first_output_limit = Duration::from_secs(FIRST_OUTPUT_SECS).min(self.timeout);
+        // Short test timeouts still need a fast tick.
+        let tick = Duration::from_secs(WATCHDOG_TICK_SECS)
+            .min((self.timeout / 10).max(Duration::from_millis(10)));
+        let mut elapsed = Duration::ZERO;
+        let output = loop {
+            tokio::select! {
+                res = &mut read_output => {
+                    break res.map_err(|e| format!("CLI çıktısı okunamadı: {e}"))?;
+                }
+                _ = tokio::time::sleep(tick) => {
+                    elapsed += tick;
+                    let silent = seen.load(Ordering::Relaxed) == 0;
+                    if silent && elapsed >= first_output_limit {
+                        return Err(format!(
+                            "'{program}' ilk {} boyunca hiç çıktı vermedi; model yanıt vermiyor olabilir, süreç öldürüldü.",
+                            human_duration(first_output_limit)
+                        ));
+                    }
+                    if elapsed >= self.timeout {
+                        return Err(format!(
+                            "'{program}' {} içinde yanıt vermedi; süreç öldürüldü.",
+                            human_duration(self.timeout)
+                        ));
+                    }
+                }
             }
         };
 
@@ -677,6 +745,26 @@ mod tests {
         let output = provider.complete("merhaba", "sistem").await.unwrap();
         assert!(output.contains("merhaba"));
         assert!(output.contains("sistem"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn silent_cli_is_killed_with_clear_error() {
+        // Ölü sağlayıcı: süreç başlar, hiç çıktı vermez. Kullanıcı spinner'da
+        // kalmasın diye sessizlik koruması devreye girmeli.
+        let cfg = ProviderConfig {
+            source: ProviderSource::Ide,
+            ide_kind: IdeKind::CustomCli,
+            ide_command: Some("sleep".into()),
+            ide_args: vec!["{prompt}".into()],
+            ..Default::default()
+        };
+        let mut provider =
+            IdeBridgeProvider::new(&cfg, std::path::Path::new(".")).expect("provider");
+        provider.timeout = Duration::from_secs(1);
+        let err = provider.complete("30", "").await.unwrap_err();
+        assert!(err.contains("hiç çıktı vermedi"), "{err}");
+        assert!(err.contains("öldürüldü"), "{err}");
     }
 
     #[cfg(unix)]

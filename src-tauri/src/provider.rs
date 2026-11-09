@@ -78,6 +78,12 @@ impl FallbackProvider {
             || contains_code(&lower, "502")
             || contains_code(&lower, "504")
             || lower.contains("temporarily unavailable")
+            // Dead endpoint / model that accepts the call but never answers
+            || lower.contains("yanıt vermedi")
+            || lower.contains("hiç çıktı vermedi")
+            || lower.contains("timed out")
+            || lower.contains("timeout")
+            || lower.contains("deadline exceeded")
     }
 }
 
@@ -291,5 +297,13 @@ mod tests {
         assert!(!FallbackProvider::is_fallback_error(
             "bağlantı 127.0.0.1:15029 reddedildi"
         ));
+        // Sessiz kalan model: zincirdeki yedek modele geçilmeli.
+        assert!(FallbackProvider::is_fallback_error(
+            "'opencode' 180 saniye içinde yanıt vermedi; süreç öldürüldü."
+        ));
+        assert!(FallbackProvider::is_fallback_error(
+            "'opencode' ilk 180 saniye boyunca hiç çıktı vermedi; model yanıt vermiyor olabilir."
+        ));
+        assert!(FallbackProvider::is_fallback_error("request timed out"));
     }
 }

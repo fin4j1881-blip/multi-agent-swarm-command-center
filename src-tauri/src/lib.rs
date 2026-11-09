@@ -250,7 +250,11 @@ async fn analyze_project(
         .map_err(|e| format!("Klasör açılamadı: {e}"))?;
 
     let overview = workspace::read_project_overview(&canonical).await;
-    let provider = provider::build(&config, &canonical, "Mimar")?;
+    // Tarama tek atımlık bir çağrı; ölü bir modelde kullanıcıyı dakikalarca
+    // bekletmek yerine her modeli en fazla 120 saniye dene, sonra yedeğe geç.
+    let mut scan_config = config.clone();
+    scan_config.timeout_secs = scan_config.timeout_secs.clamp(30, 120);
+    let provider = provider::build(&scan_config, &canonical, "Mimar")?;
 
     let system_prompt = r#"Sen kıdemli bir yazılım mimarısın. Verilen proje dosya ağacı ve ana dosyaları inceleyerek projeyi otonom yönetecek multi-agent sistemi için iki metin hazırla.
 1. VİZYON (vision): Projenin ne olduğunu, teknolojilerini, mimarisini, amaçlarını anlatan 2-4 cümlelik net ve zengin bir vizyon paragrafı.
