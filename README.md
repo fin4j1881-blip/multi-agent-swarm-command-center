@@ -67,6 +67,7 @@ Kod asla doğrudan diske yazılmaz; ret edilen öneri sadece log'da görünür.
 │   ├── tauri.conf.json
 │   ├── capabilities/default.json
 │   ├── icons/
+│   ├── systems.json          # sistem tanımları (derlemeye gömülür)
 │   └── src/
 │       ├── main.rs           # Tauri başlatıcı
 │       ├── lib.rs            # IPC komutları
@@ -79,6 +80,7 @@ Kod asla doğrudan diske yazılmaz; ret edilen öneri sadece log'da görünür.
 │       ├── prompts.rs        # Komutan / İşçi / denetçi prompt sözleşmeleri
 │       ├── protocol.rs       # JSON & markdown protokol parser'ları
 │       ├── workspace.rs      # güvenli path, ağaç tarama, yedek, atomik yazma
+│       ├── systems.rs        # gömülü sistem tanımları (eşleştirme + prompt bloğu)
 │       ├── util.rs           # ortak metin yardımcıları
 │       └── state.rs          # AppState, log/event yayını
 ├── ui/
@@ -333,6 +335,23 @@ Yazma güvenliği:
 
 Ayrıca `.gitignore` içinde `.swarm/` ve `.env` hazırdır.
 
+### 6.1 Gömülü sistem tanımları
+
+Proje vizyonu ve genel talimatlar tek başına bir sistemin teknoloji yığınını, komutlarını ve
+deploy akışını anlatmaya yetmez. Bu yüzden `src-tauri/systems.json` içinde sistem başına
+yapılandırılmış bir tanım tutulur:
+
+- özet, teknoloji yığını, mimari
+- derleme/test/lint/deploy komutları
+- deploy adımları (her sürümde ne yapılacağı)
+- kurallar ve yasaklar
+- varsayılan vizyon ve talimatlar
+
+Tanımlar `include_str!` ile derlemeye gömülür; çalışma anında dosya okunmaz. Seçilen proje
+klasörü önce tam yol, sonra klasör adıyla eşleştirilir. Eşleşme varsa tanım hem arayüzdeki
+"Sistem tanımı" panelinde gösterilir hem de Komutan, İşçi ve denetçi promptlarına eklenir.
+Yeni bir sistem eklemek için `systems.json`'a kayıt ekleyip yeniden derlemek yeterlidir.
+
 ---
 
 ## 7. IPC komutları
@@ -346,6 +365,9 @@ Ayrıca `.gitignore` içinde `.swarm/` ve `.env` hazırdır.
 | `get_stats` | — | `{ running, stats }` (log geçmişi olmadan, sık sorgu için) |
 | `check_provider` | `{ config: ProviderConfig, projectPath?: string }` | test yanıtı |
 | `list_models` | `{ config: ProviderConfig, projectPath?: string }` | `{ models: [{ id, name, context? }], source, note }` |
+| `get_file_diff` | `{ filePath, projectPath? }` | diff satırları (JSON) |
+| `list_systems` | — | gömülü sistem tanımları |
+| `get_system_definition` | `{ projectPath }` | eşleşen tanım veya `null` |
 
 Canlı olaylar: `agent-log` (her adım) ve `agent-status` (`{ running }`).
 `AppState` `Arc<tokio::sync::Mutex<...>>` içinde tutulur, log'lar 800 kayıtla sınırlıdır.

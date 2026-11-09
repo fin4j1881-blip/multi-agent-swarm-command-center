@@ -27,6 +27,7 @@ ZORUNLU KURALLAR
 pub fn plan_prompt(
     vision: &str,
     instructions: &str,
+    system_context: &str,
     tree: &str,
     completed: &[String],
     failures: &[String],
@@ -63,8 +64,14 @@ pub fn plan_prompt(
         )
     };
 
+    let system_block = if system_context.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n\n", system_context.trim())
+    };
+
     format!(
-        r#"{instructions_block}PROJE VİZYONU
+        r#"{system_block}{instructions_block}PROJE VİZYONU
 ================
 {vision}
 
@@ -111,6 +118,7 @@ ZORUNLU KURALLAR
 pub fn coder_prompt(
     vision: &str,
     instructions: &str,
+    system_context: &str,
     task: &PlanTask,
     current: Option<&str>,
     context_files: &str,
@@ -166,8 +174,14 @@ pub fn coder_prompt(
         )
     };
 
+    let system_block = if system_context.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n\n", system_context.trim())
+    };
+
     format!(
-        r#"{instructions_block}PROJE VİZYONU (bağlam)
+        r#"{system_block}{instructions_block}PROJE VİZYONU (bağlam)
 ================
 {vision}
 
@@ -231,6 +245,7 @@ KURALLAR
 
 pub fn review_prompt(
     vision: &str,
+    system_context: &str,
     task: &PlanTask,
     proposal: &Proposal,
     current: Option<&str>,
@@ -256,6 +271,12 @@ pub fn review_prompt(
             .join("\n")
     };
 
+    let system_block = if system_context.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n\n", system_context.trim())
+    };
+
     let current_block = match current {
         Some(text) if !text.trim().is_empty() => {
             format!("MEVCUT DOSYA\n---8<---\n{text}\n---8<---")
@@ -264,7 +285,7 @@ pub fn review_prompt(
     };
 
     format!(
-        r#"PROJE VİZYONU
+        r#"{system_block}PROJE VİZYONU
 ================
 {vision}
 

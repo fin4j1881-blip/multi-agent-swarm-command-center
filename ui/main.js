@@ -17,6 +17,8 @@ const state = {
   roundStartTime: null,
   completedRoundDurations: [],
   lastWrittenFile: null,
+  systems: [],
+  activeSystem: null,
 };
 
 const IDE_HINTS = {
@@ -849,6 +851,138 @@ function persist() {
 
 const projectRunningMap = {};
 
+/* ---------------- embedded system definitions ---------------- */
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function normalizePath(path) {
+  return String(path || "").trim().replace(/[\\/]+$/, "");
+}
+
+function findSystemForPath(path) {
+  const target = normalizePath(path);
+  if (!target) return null;
+
+  const byPath = state.systems.find((system) =>
+    (system.paths || []).some((candidate) => normalizePath(candidate) === target)
+  );
+  if (byPath) return byPath;
+
+  const dir = target.split(/[\\/]/).filter(Boolean).pop();
+  if (!dir) return null;
+  return (
+    state.systems.find((system) => (system.dirNames || []).includes(dir)) || null
+  );
+}
+
+function renderSystemPanel(definition) {
+  const panel = $("systemPanel");
+  const nameEl = $("systemPanelName");
+  const body = $("systemPanelBody");
+  if (!panel || !nameEl || !body) return;
+
+  if (!definition) {
+    panel.classList.add("hidden");
+    panel.open = false;
+    nameEl.textContent = "—";
+    body.innerHTML = "";
+    return;
+  }
+
+  panel.classList.remove("hidden");
+  nameEl.textContent = definition.name;
+
+  const section = (title, inner) =>
+    inner ? `<section><h4>${escapeHtml(title)}</h4>${inner}</section>` : "";
+
+  const list = (items) =>
+    items && items.length
+      ? `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
+      : "";
+
+  const commands =
+    definition.commands && definition.commands.length
+      ? `<div class="sys-cmds">${definition.commands
+          .map(
+            (cmd) =>
+              `<div class="sys-cmd"><span>${escapeHtml(cmd.name)}</span><code>${escapeHtml(
+                cmd.command
+              )}</code></div>`
+          )
+          .join("")}</div>`
+      : "";
+
+  body.innerHTML = [
+    section("Özet", definition.summary ? `<p>${escapeHtml(definition.summary)}</p>` : ""),
+    section("Teknoloji", list(definition.stack)),
+    section(
+      "Mimari",
+      definition.architecture ? `<p>${escapeHtml(definition.architecture)}</p>` : ""
+    ),
+    section("Komutlar", commands),
+    section("Deploy", definition.deploy ? `<p>${escapeHtml(definition.deploy)}</p>` : ""),
+    section("Kurallar", list(definition.rules)),
+    definition.forbidden && definition.forbidden.length
+      ? `<section class="sys-forbidden"><h4>Yasaklar</h4>${list(definition.forbidden)}</section>`
+      : "",
+  ].join("");
+}
+
+function applySystemDefinition(path) {
+  const definition = findSystemForPath(path);
+  state.activeSystem = definition;
+  renderSystemPanel(definition);
+  if (!definition) return;
+
+  const visionEl = $("vision");
+  const instructionsEl = $("instructions");
+  if (visionEl && !visionEl.value.trim() && definition.vision) {
+    visionEl.value = definition.vision;
+    $("visionCount").textContent = `${visionEl.value.trim().length}`;
+  }
+  if (instructionsEl && !instructionsEl.value.trim() && definition.instructions) {
+    instructionsEl.value = definition.instructions;
+  }
+}
+
+async function loadSystems() {
+  if (!invoke) return;
+  try {
+    const systems = await invoke("list_systems");
+    state.systems = Array.isArray(systems) ? systems : [];
+  } catch {
+    state.systems = [];
+  }
+}
+
+function hiddenSystemIds() {
+  try {
+    const raw = JSON.parse(localStorage.getItem("swarm.hiddenSystems.v1") || "[]");
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+}
+
+function hideSystem(id) {
+  if (!id) return;
+  const hidden = hiddenSystemIds();
+  if (!hidden.includes(id)) hidden.push(id);
+  try {
+    localStorage.setItem("swarm.hiddenSystems.v1", JSON.stringify(hidden));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+
 function getKnownProjects() {
   const keys = [];
   try {
@@ -859,6 +993,14 @@ function getKnownProjects() {
       }
     }
   } catch {}
+
+  const hidden = hiddenSystemIds();
+  for (const system of state.systems) {
+    const path = (system.paths || [])[0];
+    if (!path || hidden.includes(system.id)) continue;
+    if (!keys.includes(path)) keys.push(path);
+  }
+
   const current = $("projectPath")?.value?.trim();
   if (current && !keys.includes(current)) keys.push(current);
   return keys.sort();
@@ -876,6 +1018,7 @@ function renderProjectSidebar() {
     const item = document.createElement("div");
     const isRunning = Boolean(projectRunningMap[path]);
     const isActive = path === currentPath;
+    const system = findSystemForPath(path);
 
     item.className = `project-item ${isActive ? "active" : ""} ${isRunning ? "running" : ""}`;
 
@@ -885,10 +1028,11 @@ function renderProjectSidebar() {
     item.innerHTML = `
       <div class="p-name">
         <span class="p-dot" title="${isRunning ? "Çalışıyor" : "Boşta"}"></span>
-        <span>${shortName}</span>
+        <span>${escapeHtml(shortName)}</span>
+        ${system ? `<span class="p-sys-badge" title="Gömülü sistem tanımı">sistem</span>` : ""}
         <button class="p-delete-btn" type="button" title="Projeyi Arayüzden Kaldır">×</button>
       </div>
-      <div class="p-path" title="${path}">${path}</div>
+      <div class="p-path" title="${escapeHtml(path)}">${escapeHtml(path)}</div>
     `;
 
     item.querySelector(".p-delete-btn").addEventListener("click", (e) => {
@@ -912,6 +1056,9 @@ function removeProjectFromUi(path) {
     toast("Çalışan proje kaldırılamaz. Önce durdurun.", "error");
     return;
   }
+
+  const system = findSystemForPath(path);
+  if (system) hideSystem(system.id);
 
   const pKey = projectStorageKey(path);
   if (pKey) {
@@ -982,6 +1129,7 @@ async function switchProject(newPath) {
   persist(); // Save current project
   $("projectPath").value = newPath;
   loadProjectData(newPath);
+  applySystemDefinition(newPath);
   renderProjectSidebar();
 
   // Reset duration tracking on project switch
@@ -1103,12 +1251,14 @@ async function pickFolder() {
 
       if (hasExisting) {
         loadProjectData(folder);
+        applySystemDefinition(folder);
         persist();
         renderProjectSidebar();
       } else {
+        applySystemDefinition(folder);
         renderProjectSidebar();
         persist();
-        triggerAiProjectAnalysis();
+        if (!state.activeSystem) triggerAiProjectAnalysis();
       }
 
       // Sync session for the newly picked folder
@@ -1272,6 +1422,7 @@ function bind() {
   $("projectPath").addEventListener("change", () => {
     const path = $("projectPath").value;
     loadProjectData(path);
+    applySystemDefinition(path);
     persist();
     renderProjectSidebar();
     fetchSessionStatus(path)
@@ -1406,6 +1557,7 @@ async function bootstrap() {
 
   restore();
   bind();
+  await loadSystems();
 
   for (const prefix of ["arch", "coder"]) {
     applyVisibility(prefix);
@@ -1440,7 +1592,9 @@ async function bootstrap() {
   });
 
   const currentPath = $("projectPath").value.trim();
+  applySystemDefinition(currentPath);
   renderProjectSidebar();
+  if (currentPath) persist();
 
   try {
     const status = await fetchSessionStatus(currentPath);

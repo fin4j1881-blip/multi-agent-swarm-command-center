@@ -1,0 +1,118 @@
+[
+  {
+    "id": "finmos-bot",
+    "name": "Finmos Discord Bot",
+    "paths": ["/mnt/depo/bot"],
+    "dirNames": ["bot"],
+    "summary": "Rust (poise/serenity) ile yazılmış kurumsal Discord yönetim, güvenlik, otomasyon ve çoklu-evren RP botu. PostgreSQL (sqlx) kullanır, Heroku üzerinde çalışır. Yapay zeka özelliklerinde Umay Zeka birincil, OpenRouter yedek sağlayıcıdır.",
+    "stack": [
+      "Rust 2021",
+      "poise 0.6 + serenity 0.12 (vendor/serenity patch)",
+      "tokio, tokio-cron-scheduler",
+      "sqlx + PostgreSQL",
+      "reqwest, serde, thiserror",
+      "aes-gcm (API anahtarı şifreleme)"
+    ],
+    "architecture": "src/main.rs giriş noktası. src/commands/* slash komutları, src/events/* gateway olayları, src/ai/* yapay zeka istemcisi ve oturumları, src/database/* sqlx erişimi ve migrations/, src/scheduler/* zamanlanmış işler, src/utils/* log, transcript ve deploy duyurusu.",
+    "commands": [
+      { "name": "Derle", "command": "cargo build --release" },
+      { "name": "Hızlı kontrol", "command": "cargo check" },
+      { "name": "Test", "command": "cargo test" },
+      { "name": "Lint", "command": "cargo clippy --all-targets -- -D warnings" }
+    ],
+    "deploy": "main dalına push, GitHub Actions (.github/workflows/deploy.yml) üzerinden Heroku uygulaması sahin-discord-bot'a deploy eder. Her sürümde CHANGELOG.md en üstüne '## tarih - başlık' bölümü eklenir; deploy sonrası bot bu bölümü finmos-bot-güncelleme kanalına duyurur. Aynı sürüm ikinci kez duyurulmaz. Heroku ortam değişkenleri: DISCORD_TOKEN, DATABASE_URL, DEPLOY_ANNOUNCE_CHANNEL_ID, FINMOS_MASTER_KEY.",
+    "rules": [
+      "Her değişiklikte CHANGELOG.md en üstüne yeni bir bölüm ekle; duyuru bu dosyadan okunur.",
+      "Sırları koda gömme; .env veya Heroku config kullan.",
+      "Veritabanı şeması değişirse migrations/ altına yeni dosya ekle, mevcut migration'ı düzenleme.",
+      "Yeni komut eklerken poise kaydını ve izin kontrollerini birlikte güncelle.",
+      "Kullanıcıya görünen metin Türkçe, kod kimliği İngilizce."
+    ],
+    "forbidden": [
+      "Tablolarda doğrudan silme/truncate",
+      "Token veya API anahtarını loglama",
+      "Mevcut migration dosyalarını değiştirme",
+      "vendor/serenity patch'ini gerekçesiz güncelleme"
+    ],
+    "vision": "Finmos Discord Bot; kurumsal Discord sunucuları için moderasyon, güvenlik, otomasyon, ekonomi ve çoklu-evren RP özelliklerini tek botta toplayan Rust tabanlı bir sistemdir. PostgreSQL kalıcı veri kaynağıdır, Heroku üzerinde çalışır ve her sürümde değişiklik notlarını ilgili kanala duyurur. Mevcut komut davranışları ve veritabanı uyumluluğu korunmalıdır.",
+    "instructions": "Değişiklikleri küçük ve geri alınabilir tut. Yeni özellik eklerken önce mevcut komut ve tablo yapısını oku. Her sürümde CHANGELOG.md güncelle. Deploy sonrası duyurunun finmos-bot-güncelleme kanalına gittiğini varsay; mesajı emojisiz ve sade yaz."
+  },
+  {
+    "id": "finmos-website",
+    "name": "finmos.com.tr",
+    "paths": ["/mnt/depo/Finmos/finmos.com.tr"],
+    "dirNames": ["finmos.com.tr"],
+    "summary": "Finmos AI IDE ürün sitesi. Vite 8 + React 19 + Tailwind v4 ile geliştirilen statik SPA, Cloudflare Pages üzerinde yayınlanır. Production API Cloudflare Pages Functions, veri kaynağı Cloudflare D1'dir (hesap, lisans, yetki, cihaz ve oturum).",
+    "stack": [
+      "Vite 8 + React 19",
+      "React Router 7",
+      "Tailwind CSS v4 + lucide-react",
+      "Cloudflare Pages + Pages Functions",
+      "Cloudflare D1 (SQL)",
+      "wrangler, oxlint, node:test"
+    ],
+    "architecture": "src/ React uygulaması ve route'lar; functions/ Cloudflare Pages Functions API'si; migrations/ D1 şeması; scripts/ build, prerender, deploy, health ve smoke testleri; public/_redirects SPA yönlendirmeleri; dist/ üretilen çıktı.",
+    "commands": [
+      { "name": "Geliştirme", "command": "npm run dev" },
+      { "name": "Tam kontrol", "command": "npm run check" },
+      { "name": "Lint", "command": "npm run lint" },
+      { "name": "Test", "command": "npm test" },
+      { "name": "Build", "command": "npm run build" },
+      { "name": "Staging deploy", "command": "npm run deploy:staging" },
+      { "name": "Production deploy", "command": "npm run deploy:production" },
+      { "name": "Production sağlık", "command": "npm run health:production" }
+    ],
+    "deploy": "npm run check (lint + test + build) geçmeden deploy yapılmaz. Önce npm run deploy:staging ile staging'e çık, duman testlerini çalıştır, sonra npm run deploy:production ile production'a al. Cloudflare Pages build komutu 'npm run build', çıktı dizini 'dist'. D1 şema değişiklikleri migrations/ altına eklenir. Production sağlık kontrolü https://finmos.com.tr/api/v1/health.",
+    "rules": [
+      "Yeni ortam değişkenini .env.example içinde belgele.",
+      "D1 şemasını değiştirirken yeni migration ekle; mevcut migration'ı değiştirme.",
+      "SPA route eklerken public/_redirects davranışını koru.",
+      "dist/ elle düzenlenmez; kaynak src/ ve functions/ altında değiştirilir.",
+      "Production'a çıkmadan staging doğrulaması ve sağlık kontrolü yap."
+    ],
+    "forbidden": [
+      "Production D1 üzerinde yıkıcı sorgu",
+      "Sırları repoya veya istemci koduna koyma",
+      "dist/ dosyalarını elle düzenleme",
+      "Test ve lint atlanarak doğrudan production deploy"
+    ],
+    "vision": "finmos.com.tr, Finmos AI IDE ürününün tanıtım ve dokümantasyon sitesidir. Hızlı, erişilebilir ve SEO uyumlu bir React SPA olarak Cloudflare üzerinde çalışır; lisans, hesap ve cihaz işlemleri Pages Functions ve D1 üzerinden yürütülür. Tasarım dili IDE-shell estetiğini korur.",
+    "instructions": "Değişiklikten sonra npm run check çalıştır. Yeni sayfa veya route eklerken yönlendirmeleri ve prerender betiğini kontrol et. API değişikliklerinde staging duman testini çalıştır. Kullanıcı metinleri Türkçe, kod kimliği İngilizce."
+  },
+  {
+    "id": "micup-rs",
+    "name": "micup-rs",
+    "paths": ["/mnt/depo/micup-rs"],
+    "dirNames": ["micup-rs"],
+    "summary": "Micup.gg ve Fluxer platformları için resmi olmayan, async Rust kütüphanesi (crate adı micup, sürüm 0.5.0). REST, Gateway, CDN, tür güvenli olay sistemi ve embed!/button! makroları sunar. Finmos Bot bu kütüphaneyi git revizyonu ile kullanır.",
+    "stack": [
+      "Rust 2021",
+      "tokio + tokio-tungstenite",
+      "reqwest (rustls)",
+      "serde / serde_json",
+      "thiserror, tracing, chrono"
+    ],
+    "architecture": "src/ modülleri REST istemcisi, Gateway bağlantısı, olay tipleri, Context ve makroları barındırır. examples/ çalıştırılabilir örnekler, README.md ana dokümantasyondur. Public API kararlılığı esastır.",
+    "commands": [
+      { "name": "Derle", "command": "cargo build" },
+      { "name": "Test", "command": "cargo test" },
+      { "name": "Lint", "command": "cargo clippy --all-targets -- -D warnings" },
+      { "name": "Dokümantasyon", "command": "cargo doc --no-deps" },
+      { "name": "Yayın ön kontrolü", "command": "cargo publish --dry-run" }
+    ],
+    "deploy": "crates.io yayını: Cargo.toml sürümü artırılır, README ve davranış değişiklikleri güncellenir, cargo publish --dry-run temiz geçtikten sonra cargo publish çalıştırılır. Kırıcı değişiklikte Finmos Bot'un Cargo.toml içindeki micup git revizyonu güncellenir ve bot yeniden derlenir.",
+    "rules": [
+      "Semver'e uy; kırıcı değişiklikte sürümü buna göre artır.",
+      "Yeni public API'ye dokümantasyon ve örnek ekle.",
+      "examples/ derlenebilir ve güncel kalsın.",
+      "Gateway/REST davranışını değiştirirken bot tarafındaki etkiyi not et."
+    ],
+    "forbidden": [
+      "Gerekçesiz sürüm yank (yank) işlemi",
+      "Token veya API anahtarını repoya koyma",
+      "Public API'yi haber vermeden kırma"
+    ],
+    "vision": "micup-rs, Micup.gg ve Fluxer botları geliştirenler için eksiksiz, asenkron ve ergonomik bir Rust kütüphanesidir. Hem tek satırda çalışan vibe-coding akışını hem de yapısal EventHandler mimarisini destekler. API kararlılığı, dokümantasyon ve örneklerin güncelliği önceliklidir.",
+    "instructions": "Değişiklikten sonra cargo test ve cargo clippy çalıştır. Yeni özellik için examples/ altına küçük bir örnek ekle. Kırıcı değişiklikte sürümü artır ve Finmos Bot tarafındaki revizyonu güncellemeyi hatırlat."
+  }
+]

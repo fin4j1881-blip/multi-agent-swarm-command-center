@@ -10,6 +10,7 @@ use crate::prompts;
 use crate::protocol::{self, PlanTask};
 use crate::provider::{self, ModelProvider};
 use crate::state::{emit_log, emit_status, now_iso, LogEvent, RunStats, SharedState};
+use crate::systems;
 use crate::util::{condense_cargo_errors, truncate_chars};
 use crate::workspace::{self, FileText};
 use std::future::Future;
@@ -194,6 +195,7 @@ struct Runner<'a> {
     architect: FailoverChain,
     coder: FailoverChain,
     verify_build: bool,
+    system_context: String,
 }
 
 async fn run_inner(
@@ -214,6 +216,9 @@ async fn run_inner(
     let coder = build_failover_chain(&cfg.coder, &root, "İşçi")
         .map_err(|e| format!("İşçi sağlayıcısı hazırlanamadı: {e}"))?;
 
+    let system_context = systems::context_for(&root);
+    let system_name = systems::match_system(&root).map(|def| def.name);
+
     let mut runner = Runner {
         app,
         shared,
@@ -224,6 +229,7 @@ async fn run_inner(
         architect,
         coder,
         verify_build: cfg.verify_build,
+        system_context,
     };
 
     runner
@@ -243,6 +249,15 @@ async fn run_inner(
     runner
         .log("info", "system", format!("İşçi → {}", runner.coder.label()))
         .await;
+    if let Some(name) = system_name {
+        runner
+            .log(
+                "info",
+                "system",
+                format!("Sistem tanımı yüklendi: {name}"),
+            )
+            .await;
+    }
 
     runner.check_build_baseline().await;
     runner.run_rounds().await
@@ -474,6 +489,7 @@ impl Runner<'_> {
             let prompt = prompts::plan_prompt(
                 &cfg.vision,
                 &cfg.instructions,
+                &self.system_context,
                 &tree,
                 &completed,
                 &failures,
@@ -691,6 +707,7 @@ impl Runner<'_> {
             let prompt = prompts::coder_prompt(
                 &cfg.vision,
                 &cfg.instructions,
+                &self.system_context,
                 task,
                 current_text,
                 &context_block,
@@ -789,8 +806,14 @@ impl Runner<'_> {
 
             self.log("review", "review", "Komutan denetliyor…").await;
 
-            let review_prompt =
-                prompts::review_prompt(&cfg.vision, task, &proposal, current_text, &pre.warnings);
+            let review_prompt = prompts::review_prompt(
+                &cfg.vision,
+                &self.system_context,
+                task,
+                &proposal,
+                current_text,
+                &pre.warnings,
+            );
 
             let verdict_raw = match self
                 .call(

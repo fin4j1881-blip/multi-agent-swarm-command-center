@@ -1222,6 +1222,108 @@ pre.diff-code .diff-del {
   display: none !important;
 }
 
+/* ---------- embedded system definition ---------- */
+
+.system-panel {
+  margin-top: 4px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(34, 211, 238, 0.05), transparent 60%), var(--panel-2);
+  overflow: hidden;
+}
+
+.system-panel > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.system-panel > summary::-webkit-details-marker {
+  display: none;
+}
+
+.system-panel > summary b {
+  font-size: 12px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.system-panel[open] > summary {
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.system-body {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.system-body h4 {
+  margin: 0 0 3px;
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted-2);
+}
+
+.system-body p {
+  margin: 0;
+  color: var(--text);
+}
+
+.system-body ul {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.system-body code {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--accent);
+  background: rgba(34, 211, 238, 0.08);
+  border: 1px solid rgba(34, 211, 238, 0.18);
+  border-radius: 5px;
+  padding: 1px 5px;
+  word-break: break-all;
+}
+
+.system-body .sys-cmd {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.system-body .sys-forbidden li {
+  color: #fecaca;
+}
+
+.project-item .p-sys-badge {
+  margin-left: 6px;
+  font-size: 8.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+  border: 1px solid rgba(34, 211, 238, 0.35);
+  border-radius: 999px;
+  padding: 1px 5px;
+  flex-shrink: 0;
+}
+
 /* ---------- responsive ---------- */
 
 @media (max-width: 1040px) {

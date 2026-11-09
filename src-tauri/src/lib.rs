@@ -10,6 +10,7 @@ mod prompts;
 mod protocol;
 mod provider;
 mod state;
+mod systems;
 mod util;
 mod workspace;
 
@@ -304,6 +305,18 @@ async fn get_file_diff(
     serde_json::to_string(&diff).map_err(|e| format!("Diff serileştirilemedi: {e}"))
 }
 
+/// Returns the embedded system definitions so the UI can list known systems.
+#[tauri::command]
+fn list_systems() -> Vec<systems::SystemDefinition> {
+    systems::all().to_vec()
+}
+
+/// Returns the embedded definition matching a project directory, if any.
+#[tauri::command]
+fn get_system_definition(project_path: String) -> Option<systems::SystemDefinition> {
+    systems::match_system(std::path::Path::new(project_path.trim()))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let shared: SharedState = Arc::new(Mutex::new(AppState::default()));
@@ -321,7 +334,9 @@ pub fn run() {
             list_models,
             open_new_window,
             analyze_project,
-            get_file_diff
+            get_file_diff,
+            list_systems,
+            get_system_definition
         ])
         .run(tauri::generate_context!())
         .expect("Tauri uygulaması başlatılamadı");
